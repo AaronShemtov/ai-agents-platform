@@ -50,7 +50,11 @@ jobs:
     needs: test
     # Only publish from main; PRs stop after the test job.
     if: github.event_name != 'pull_request'
-    runs-on: ubuntu-latest
+    # Native arm64 runner (free for public repositories), so the build is not
+    # emulated. Under QEMU on an amd64 runner `python -m venv` alone took 43s.
+    # If this label is ever unavailable the job fails immediately with "no runner
+    # matching labels" — revert to ubuntu-latest and restore the QEMU step below.
+    runs-on: ubuntu-24.04-arm
 
     permissions:
       contents: read
@@ -59,8 +63,7 @@ jobs:
       - name: Checkout
         uses: actions/checkout@v4
 
-      - name: Set up QEMU
-        uses: docker/setup-qemu-action@v3
+      # No QEMU: the runner is already arm64, so there is nothing to emulate.
 
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@v3

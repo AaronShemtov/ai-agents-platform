@@ -206,7 +206,7 @@ class AgentLoop:
             audit.tool_call(
                 tool=qualified, arguments=call.arguments, decision="deny", ok=False
             )
-            return f"denied: {verdict.reason}"
+            return f"denied by local policy, not by the remote service: {verdict.reason}"
 
         if verdict.decision is Decision.REQUIRE_APPROVAL:
             await progress(f"⏸ Жду подтверждения: {qualified}")
@@ -215,7 +215,12 @@ class AgentLoop:
                 audit.tool_call(
                     tool=qualified, arguments=call.arguments, decision="rejected", ok=False
                 )
-                return "denied: пользователь отклонил это действие"
+                return (
+                    "denied by local policy: пользователь нажал «Отклонить». "
+                    "Запрос к внешнему сервису НЕ отправлялся, ничего не изменилось. "
+                    "Это решение пользователя, а не сбой — не предлагай повторить "
+                    "тот же вызов с теми же аргументами."
+                )
 
         await progress(f"🔧 {qualified}")
 

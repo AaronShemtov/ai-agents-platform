@@ -78,7 +78,9 @@ class Settings(BaseSettings):
     github_write_mode: WriteMode = WriteMode.DIRECT_PUSH
     cloudflare_write_mode: WriteMode = WriteMode.APPROVE
     # Repos that may never be pushed to directly, whatever github_write_mode says.
-    # A bad manifest landing in the GitOps repo reaches the cluster within ~10 minutes.
+    # A bad manifest landing in the GitOps repo reaches the cluster in about a minute:
+    # source-controller polls git on a 1m interval and kustomize-controller reconciles on
+    # the source-revision change rather than waiting for its own 10m interval.
     protected_repos: str = "personal-k8s"  # comma-separated
 
     # --- limits ------------------------------------------------------------

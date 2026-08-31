@@ -1,0 +1,3 @@
+# Authored on Windows, built and run on Linux. Normalise to LF in the repository so
+# a CRLF never reaches a Dockerfile, a shell heredoc or a YAML manifest.
+* text=auto eol=lf

@@ -1,0 +1,64 @@
+[project]
+name = "ai-agents-platform"
+version = "0.1.0"
+description = "Personal AI agent platform: Telegram-driven agents with MCP tools for GitHub, Cloudflare and Kubernetes"
+requires-python = ">=3.12"
+dependencies = [
+    # MCP SDK v2. NOTE: v2 renamed streamablehttp_client -> streamable_http_client,
+    # FastMCP -> MCPServer, and moved model fields to snake_case (input_schema,
+    # is_error, structured_content). Almost every tutorial online still shows v1
+    # names. Pin to <3 so the next breaking release does not land silently.
+    "mcp>=2.1,<3",
+    # openai 3.x is also on httpx2, so it shares a transport stack with mcp.
+    "openai>=3.0,<4",
+    "python-telegram-bot>=21.9,<23",
+    "pydantic>=2.9",
+    "pydantic-settings>=2.6",
+    "PyYAML>=6.0",
+    "structlog>=24.4",
+    "httpx2>=2.5",
+    # Only used by the mcp_cluster entrypoint, but all entrypoints ship in one image.
+    "kubernetes>=31.0",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.3",
+    "pytest-asyncio>=0.24",
+    "ruff>=0.8",
+]
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = [
+    "src/agentcore",
+    "src/mcp_common",
+    "src/mcp_cloudflare",
+    "src/mcp_cluster",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+asyncio_mode = "auto"
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+src = ["src", "tests"]
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B", "SIM", "RUF"]
+ignore = [
+    # Line length is a formatting concern, not a correctness one, and nothing in this
+    # project runs `ruff format` as a gate.
+    "E501",
+    # Function calls in argument defaults — the MCP tool decorators rely on them.
+    "B008",
+    # Ambiguous-unicode warnings fire on the Russian prompts and user-facing strings.
+    "RUF001",
+    "RUF002",
+    "RUF003",
+]

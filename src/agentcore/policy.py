@@ -23,8 +23,8 @@ from typing import Any
 from agentcore.config import Settings, WriteMode
 from agentcore.mcp.client import split_qualified
 
-# Verbs that only read. Anything not starting with one of these is treated as
-# mutating — unknown tools should be gated, not waved through.
+# Verbs that only read. Anything not matching these is treated as mutating — unknown
+# tools should be gated, not waved through.
 READ_PREFIXES = (
     "get_",
     "list_",
@@ -36,6 +36,16 @@ READ_PREFIXES = (
     "find_",
     "check_",
     "download_",
+)
+
+# GitHub MCP has dispatcher tools whose operation is selected by a required `method`
+# argument. Despite not starting with a read verb, these expose read operations only.
+# Keep this explicit rather than allowing every name containing "read".
+READ_ONLY_TOOLS = frozenset(
+    {
+        "issue_read",
+        "pull_request_read",
+    }
 )
 
 # Branch names we treat as "the branch Flux and production read from".
@@ -63,7 +73,7 @@ class Verdict:
 
 
 def is_read_only_tool(bare_name: str) -> bool:
-    return bare_name.startswith(READ_PREFIXES)
+    return bare_name in READ_ONLY_TOOLS or bare_name.startswith(READ_PREFIXES)
 
 
 def _arg(arguments: dict[str, Any], keys: tuple[str, ...]) -> str | None:
@@ -90,21 +100,16 @@ class Policy:
         if server == "cloudflare":
             return self._cloudflare(bare)
         if server == "cluster":
-            # The ClusterRole makes writes impossible anyway; refusing here gives the
-            # model a clear explanation instead of an opaque 403 from the apiserver.
             return Verdict(
                 Decision.DENY,
                 "кластер только на чтение: он управляется через GitOps. "
                 "Чтобы изменить кластер, отредактируй манифесты в personal-k8s и открой PR.",
             )
 
-        # Unknown namespace: gate rather than guess.
         return Verdict(
             Decision.REQUIRE_APPROVAL,
             f"инструмент {qualified_name} не относится к известным пространствам имён",
         )
-
-    # -- per-namespace rules -------------------------------------------------
 
     def _github(self, bare: str, arguments: dict[str, Any]) -> Verdict:
         mode = self._s.github_write_mode
@@ -114,11 +119,8 @@ class Policy:
 
         repo = _arg(arguments, _REPO_KEYS)
         branch = _arg(arguments, _BRANCH_KEYS)
-        # A missing branch means the tool will act on the repository default branch.
         targets_default = branch is None or branch.lower() in DEFAULT_BRANCHES
 
-        # Protected repos: writable, but only through a pull request. This survives
-        # direct-push mode on purpose.
         if repo and repo.lower() in self._protected and targets_default:
             if bare.startswith(("create_pull_request", "create_branch")):
                 return Verdict(Decision.ALLOW)
@@ -145,8 +147,6 @@ class Policy:
             )
         if mode is WriteMode.AUTO:
             return Verdict(Decision.ALLOW)
-        # Default: APPROVE. A wrong DNS record or tunnel config takes 1ms.my offline,
-        # and unlike a bad commit there is nothing to revert.
         return Verdict(
             Decision.REQUIRE_APPROVAL,
             f"изменение в Cloudflare ({bare}) требует подтверждения",

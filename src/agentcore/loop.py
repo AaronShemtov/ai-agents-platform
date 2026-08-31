@@ -35,9 +35,9 @@ from agentcore.profiles import AgentProfile
 
 logger = logging.getLogger(__name__)
 
-# A single tool result can be enormous (a whole file, a full pod list). Truncate so one
-# greedy call cannot evict the rest of the conversation from the context window.
-MAX_TOOL_RESULT_CHARS = 20_000
+# Tool output is paid for again as prompt input on every following step. Keep enough
+# detail to act on, but do not let a full patch or log consume the whole transcript.
+MAX_TOOL_RESULT_CHARS = 12_000
 
 ProgressFn = Callable[[str], Awaitable[None]]
 ApproverFn = Callable[[str, dict[str, Any], str], Awaitable[bool]]
@@ -82,6 +82,12 @@ class AgentLoop:
 
     @property
     def max_tokens(self) -> int:
+        """Approximate input-context budget used when trimming chat history.
+
+        This is not a cumulative per-turn usage cap: prompt tokens are counted again
+        on every agent step, so summing them and comparing with this value caused
+        healthy multi-step tasks to stop with a false token-limit message.
+        """
         return self._profile.max_tokens_per_turn or self._settings.max_tokens_per_turn
 
     async def catalog(self, *, force_refresh: bool = False) -> ToolCatalog:
@@ -114,14 +120,6 @@ class AgentLoop:
                 answer = answer or "Отменено."
                 break
 
-            if usage.total > self.max_tokens:
-                stopped = "token_budget"
-                answer = answer or (
-                    "Достиг лимита токенов на один запрос. Скажи, продолжать ли, "
-                    "и я возьмусь за оставшуюся часть отдельно."
-                )
-                break
-
             steps += 1
             messages = chat.transcript(self._profile.system_prompt, max_tokens=self.max_tokens)
 
@@ -149,6 +147,16 @@ class AgentLoop:
                 }
             )
 
+            # This is the provider's real stop signal. Do not execute a possibly
+            # truncated tool call and do not let the model invent a different reason.
+            if response.finish_reason == "length":
+                stopped = "model_output_limit"
+                answer = response.content or (
+                    "Модель достигла своего лимита ответа до завершения задачи. "
+                    "Продолжи отдельным сообщением."
+                )
+                break
+
             if not response.tool_calls:
                 answer = response.content or ""
                 stopped = "completed"
@@ -167,8 +175,8 @@ class AgentLoop:
         else:
             stopped = "max_steps"
             answer = (
-                f"Остановился после {self.max_steps} шагов, не дойдя до конца. "
-                "Опиши задачу поменьше или уточни, что делать дальше."
+                f"Остановился после {self.max_steps} шагов: достигнут лимит шагов агента, "
+                "а не лимит токенов модели. Скажи продолжать — продолжу из текущего контекста."
             )
 
         audit.turn(
@@ -182,8 +190,6 @@ class AgentLoop:
         )
         return LoopResult(text=answer, steps=steps, usage=usage, stopped_because=stopped)
 
-    # -- one tool call -------------------------------------------------------
-
     async def _execute(
         self,
         call: ToolCall,
@@ -195,7 +201,6 @@ class AgentLoop:
     ) -> str:
         qualified = catalog.resolve(call.name)
         if qualified is None:
-            # The model invented a tool, or called one filtered out by the profile.
             audit.denied(tool=call.name, reason="unknown tool")
             return f"error: инструмента {call.name} не существует. Доступные: {catalog.names()}"
 
@@ -216,10 +221,8 @@ class AgentLoop:
                     tool=qualified, arguments=call.arguments, decision="rejected", ok=False
                 )
                 return (
-                    "denied by local policy: пользователь нажал «Отклонить». "
-                    "Запрос к внешнему сервису НЕ отправлялся, ничего не изменилось. "
-                    "Это решение пользователя, а не сбой — не предлагай повторить "
-                    "тот же вызов с теми же аргументами."
+                    "denied by local policy, not by the remote service: "
+                    "пользователь отклонил это действие"
                 )
 
         await progress(f"🔧 {qualified}")
@@ -239,12 +242,7 @@ class AgentLoop:
 
 
 def _serialise_call(call: ToolCall) -> dict[str, Any]:
-    """Rebuild the tool_call entry for the transcript.
-
-    Built explicitly rather than echoing the provider's raw message: the raw object
-    carries extra fields (refusal, annotations, audio) that some endpoints reject when
-    handed straight back.
-    """
+    """Rebuild the tool_call entry for the transcript."""
     return {
         "id": call.id,
         "type": "function",

@@ -23,7 +23,7 @@ from agentcore.mcp.client import MCPPool, MCPServerConfig
 from agentcore.memory import MemoryStore
 from agentcore.policy import Policy
 from agentcore.profiles import ProfileNotFound, load_profile
-from agentcore.ui.telegram import TelegramUI
+from agentcore.ui import TelegramUI
 
 logger = logging.getLogger(__name__)
 

@@ -125,7 +125,7 @@ def test_provider_length_finish_reason_is_reported_exactly():
     assert audit.stop_reason == "model_output_limit"
 
 
-def test_max_steps_is_not_reported_as_token_limit():
+def test_max_steps_has_a_neutral_message():
     calls = [
         LLMResponse(
             content=None,
@@ -139,8 +139,8 @@ def test_max_steps_is_not_reported_as_token_limit():
     result, audit = run(loop)
 
     assert result.stopped_because == "max_steps"
-    assert "лимит шагов" in result.text
-    assert "не лимит токенов" in result.text
+    assert "лимит шагов агента" in result.text
+    assert "лимит токенов" not in result.text
     assert audit.stop_reason == "max_steps"
 
 

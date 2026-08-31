@@ -248,6 +248,14 @@ class TelegramUI:
         text = (update.effective_message.text or "").strip()
         if not text:
             return
+        # Belt and braces. The MessageHandler filter is `TEXT & ~COMMAND`, so this
+        # should be unreachable — but the audit log once showed four model turns for
+        # three messages right after a /new, which is what a command reaching here
+        # looks like. Sending "/new" to the model costs a full turn and answers
+        # nothing, so drop it rather than trust the filter alone.
+        if text.startswith("/"):
+            logger.warning("command %r reached the message handler; ignoring", text.split()[0])
+            return
 
         status = await update.effective_message.reply_text("Думаю…")
         progress = ProgressReporter(ctx.bot, chat_id, status.message_id)

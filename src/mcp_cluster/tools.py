@@ -50,15 +50,21 @@ def readiness() -> tuple[bool, str]:
 
 
 def _api_error(exc: ApiException, what: str) -> dict[str, Any]:
+    """Shape an apiserver failure for the model.
+
+    `what` is a noun phrase naming the object, e.g. "логи cv/web-1". The templates are
+    colon-joined on purpose: an earlier version interpolated a verb phrase into
+    "{what} не найден" and produced "чтении логов cv/nonexistent-pod не найден".
+    """
     if exc.status == 403:
         return tool_error(
-            f"нет прав на {what}",
+            f"нет доступа: {what}",
             hint="у mcp-cluster намеренно только read-only ClusterRole",
             status=403,
         )
     if exc.status == 404:
-        return tool_error(f"{what} не найден", status=404)
-    return tool_error(f"ошибка API при {what}: {exc.reason}", status=exc.status)
+        return tool_error(f"не найдено: {what}", status=404)
+    return tool_error(f"ошибка API ({what}): {exc.reason}", status=exc.status)
 
 
 def register(server: Any) -> None:
@@ -70,7 +76,7 @@ def register(server: Any) -> None:
         try:
             items = core.list_namespace().items
         except ApiException as exc:
-            return _api_error(exc, "чтении namespaces")
+            return _api_error(exc, "namespaces")
         return {
             "ok": True,
             "namespaces": [
@@ -89,7 +95,7 @@ def register(server: Any) -> None:
         try:
             items = core.list_namespaced_pod(namespace).items
         except ApiException as exc:
-            return _api_error(exc, f"чтении подов в {namespace}")
+            return _api_error(exc, f"поды в {namespace}")
 
         pods = []
         for pod in items:
@@ -141,7 +147,7 @@ def register(server: Any) -> None:
                 timestamps=False,
             )
         except ApiException as exc:
-            return _api_error(exc, f"чтении логов {namespace}/{pod}")
+            return _api_error(exc, f"логи {namespace}/{pod}")
         return {"ok": True, "pod": pod, "namespace": namespace, "logs": text or "(пусто)"}
 
     @server.tool(
@@ -152,7 +158,7 @@ def register(server: Any) -> None:
         try:
             items = core.list_namespaced_event(namespace).items
         except ApiException as exc:
-            return _api_error(exc, f"чтении событий в {namespace}")
+            return _api_error(exc, f"события в {namespace}")
 
         items.sort(key=lambda e: e.last_timestamp or e.event_time or "")
         events = [
@@ -174,7 +180,7 @@ def register(server: Any) -> None:
         try:
             dep = apps.read_namespaced_deployment(name=name, namespace=namespace)
         except ApiException as exc:
-            return _api_error(exc, f"чтении deployment {namespace}/{name}")
+            return _api_error(exc, f"deployment {namespace}/{name}")
         return {
             "ok": True,
             "name": name,
@@ -205,7 +211,7 @@ def register(server: Any) -> None:
         try:
             svc = core.read_namespaced_service(name=name, namespace=namespace)
         except ApiException as exc:
-            return _api_error(exc, f"чтении service {namespace}/{name}")
+            return _api_error(exc, f"service {namespace}/{name}")
 
         addresses: list[str] = []
         try:

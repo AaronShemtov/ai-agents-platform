@@ -61,7 +61,7 @@ class CloudflareAPI:
         response = await self._client.request(method, path, json=json, params=params)
         try:
             payload = response.json()
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             raise CloudflareError(
                 f"non-JSON response ({response.status_code})", status=response.status_code
             ) from exc

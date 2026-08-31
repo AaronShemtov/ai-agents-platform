@@ -49,7 +49,7 @@ def sanitize_name(name: str) -> str:
     if len(cleaned) <= MAX_NAME:
         return cleaned
     # Keep the readable head, append a short digest so distinct long names stay distinct.
-    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:6]  # noqa: S324 - not security
+    digest = hashlib.sha1(name.encode("utf-8")).hexdigest()[:6]  # sha1 as a short disambiguator, not a security control
     return cleaned[: MAX_NAME - 7] + "_" + digest
 
 
@@ -98,7 +98,7 @@ def build_catalog(
         if name in used:
             # Two different tools collapsed onto one name after sanitising. Rare, but
             # silently dropping one would make a tool mysteriously uncallable.
-            digest = hashlib.sha1(tool.qualified_name.encode()).hexdigest()[:6]  # noqa: S324
+            digest = hashlib.sha1(tool.qualified_name.encode()).hexdigest()[:6]  # short disambiguator only
             name = f"{name[: MAX_NAME - 7]}_{digest}"
         used.add(name)
 

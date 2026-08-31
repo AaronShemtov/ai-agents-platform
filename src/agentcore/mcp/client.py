@@ -136,7 +136,7 @@ class MCPPool:
             for name in self._servers:
                 try:
                     collected.extend(await self._list_one(name))
-                except Exception as exc:  # noqa: BLE001
+                except Exception as exc:
                     # One unreachable server must not blind the agent to the others.
                     logger.warning("mcp server %s: list_tools failed: %s", name, exc)
             self._tools = collected
@@ -164,7 +164,7 @@ class MCPPool:
         try:
             async with self._session(server) as client:
                 result = await client.call_tool(tool, arguments)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exc:
             # Transport-level failure. Surface it as a tool result rather than an
             # exception so the loop can let the model react instead of dying.
             logger.warning("mcp call %s failed: %s", qualified_name, exc)

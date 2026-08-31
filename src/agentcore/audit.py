@@ -49,9 +49,9 @@ def configure_logging(level: str = "INFO") -> None:
 def _digest(arguments: dict[str, Any]) -> str:
     try:
         blob = json.dumps(arguments, sort_keys=True, ensure_ascii=False, default=str)
-    except Exception:  # noqa: BLE001
+    except Exception:  # any argument shape must still produce a digest
         blob = repr(arguments)
-    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]  # noqa: S324 - not a secret
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:12]  # sha256 here is a dedup key, not a security control
 
 
 class AuditLog:

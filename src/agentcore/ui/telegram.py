@@ -270,7 +270,7 @@ class TelegramUI:
             )
             await progress.finish()
             await self._send_long(update, result.text or "(пустой ответ)")
-        except Exception as exc:  # noqa: BLE001 - a crash must not kill the poller
+        except Exception as exc:  # a crash in one turn must not kill the poller
             logger.exception("turn failed")
             await progress.finish()
             await update.effective_message.reply_text(

@@ -55,7 +55,7 @@ def build_server(
             if inspect.isawaitable(outcome):
                 outcome = await outcome
             ok, detail = outcome
-        except Exception as exc:  # noqa: BLE001 - probe must never raise
+        except Exception as exc:  # a probe must never raise
             logger.warning("readiness check raised: %s", exc)
             return JSONResponse({"status": "not-ready", "detail": str(exc)}, status_code=503)
         if not ok:
@@ -65,7 +65,7 @@ def build_server(
     return server
 
 
-def serve(server: MCPServer, *, host: str = "0.0.0.0", port: int = 8080) -> None:  # noqa: S104
+def serve(server: MCPServer, *, host: str = "0.0.0.0", port: int = 8080) -> None:
     """Run the server over Streamable HTTP until killed.
 
     `stateless_http=True` on purpose: no session affinity, so the Deployment can be

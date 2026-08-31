@@ -28,7 +28,7 @@ def build_health_app(*, agent: str, readiness: ReadinessFn) -> Starlette:
     async def readyz(_: Request) -> JSONResponse:
         try:
             ok, detail = readiness()
-        except Exception as exc:  # noqa: BLE001 - a probe must never raise
+        except Exception as exc:  # a probe must never raise
             return JSONResponse({"status": "not-ready", "detail": str(exc)}, status_code=503)
         if not ok:
             return JSONResponse({"status": "not-ready", "detail": detail}, status_code=503)
@@ -47,7 +47,7 @@ def build_health_server(app: Starlette, *, port: int) -> uvicorn.Server:
     """A uvicorn Server to be awaited as a task on the bot's own event loop."""
     config = uvicorn.Config(
         app,
-        host="0.0.0.0",  # noqa: S104 - in-cluster, ClusterIP only
+        host="0.0.0.0",  # in-cluster only: the Service is ClusterIP, never exposed
         port=port,
         log_level="warning",
         access_log=False,

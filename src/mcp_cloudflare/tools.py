@@ -78,7 +78,7 @@ async def readiness() -> tuple[bool, str]:
         result = await get_api().request("GET", "/user/tokens/verify")
     except CloudflareError as exc:
         return False, f"cloudflare token check failed: {exc.message}"
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return False, f"cloudflare unreachable: {exc}"
     return True, f"token {result.get('status', 'unknown')}"
 
@@ -121,7 +121,8 @@ def _slim_waf_rule(rule: dict[str, Any]) -> dict[str, Any]:
 # -- registration ------------------------------------------------------------
 
 
-def register(server: Any) -> None:  # noqa: C901 - a flat list of tool definitions
+def register(server: Any) -> None:
+    """Attach the tools to an MCPServer. Long by nature: a flat list of definitions."""
     api = get_api
 
     # ---- zones ------------------------------------------------------------

@@ -44,7 +44,7 @@ def readiness() -> tuple[bool, str]:
     try:
         core, _ = _apis()
         core.list_namespace(limit=1, _request_timeout=5)
-    except Exception as exc:  # noqa: BLE001
+    except Exception as exc:
         return False, f"kube-apiserver unreachable: {exc}"
     return True, "kube-apiserver reachable"
 

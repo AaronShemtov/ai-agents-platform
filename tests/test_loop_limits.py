@@ -4,7 +4,7 @@ from unittest.mock import AsyncMock
 
 from agentcore.config import Settings
 from agentcore.llm.base import LLMResponse, ToolCall, Usage
-from agentcore.loop import AgentLoop, MAX_TOOL_RESULT_CHARS, _clip
+from agentcore.loop import MAX_TOOL_RESULT_CHARS, AgentLoop, _clip
 from agentcore.mcp.client import ToolResult
 from agentcore.mcp.toolset import ToolCatalog
 from agentcore.memory import ChatMemory

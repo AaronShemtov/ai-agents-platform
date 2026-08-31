@@ -17,6 +17,14 @@ between.
 
 Tool names are namespaced as `<server>__<tool>` so two servers can expose a tool of
 the same name, and so profile globs like `github__*` can address a whole server.
+
+Header-bound parameters — see docs/mcp-header-params.md for the full diagnosis:
+
+A server may mark a parameter in its JSON Schema with `x-mcp-header: <name>`, meaning
+the value must ALSO travel as an `Mcp-Param-<name>` HTTP header, so a gateway can see
+what a call touches without parsing the body. The GitHub server does this for `owner`
+and `repo`. The SDK refuses to send a request whose headers do not match, so without
+this every GitHub tool taking a repository was unusable — which is most of them.
 """
 
 from __future__ import annotations
@@ -69,6 +77,39 @@ class ToolResult:
 
 class MCPError(Exception):
     pass
+
+
+def header_params(schema: dict[str, Any], arguments: dict[str, Any]) -> dict[str, str]:
+    """Arguments the server wants echoed as `Mcp-Param-<name>` headers.
+
+    Only properties carrying `x-mcp-header` and actually present in this call.
+    """
+    out: dict[str, str] = {}
+    for prop, spec in (schema.get("properties") or {}).items():
+        if not isinstance(spec, dict):
+            continue
+        header = spec.get("x-mcp-header")
+        if not header or prop not in arguments:
+            continue
+        value = arguments[prop]
+        if value is None:
+            continue
+        out[f"Mcp-Param-{header}"] = str(value)
+    return out
+
+
+def explain_exception(exc: BaseException, _depth: int = 0) -> str:
+    """Flatten an ExceptionGroup down to the causes that actually say something.
+
+    anyio wraps transport failures in a task-group ExceptionGroup whose str() is
+    "unhandled errors in a TaskGroup (1 sub-exception)" — which cost real debugging
+    time once already. Never log or return the group itself.
+    """
+    if isinstance(exc, BaseExceptionGroup) and _depth < 5:
+        parts = [explain_exception(e, _depth + 1) for e in exc.exceptions]
+        joined = "; ".join(p for p in parts if p)
+        return joined or repr(exc)
+    return f"{type(exc).__name__}: {exc}"
 
 
 def split_qualified(qualified_name: str) -> tuple[str, str]:
@@ -138,7 +179,9 @@ class MCPPool:
                     collected.extend(await self._list_one(name))
                 except Exception as exc:
                     # One unreachable server must not blind the agent to the others.
-                    logger.warning("mcp server %s: list_tools failed: %s", name, exc)
+                    logger.warning(
+                        "mcp server %s: list_tools failed: %s", name, explain_exception(exc)
+                    )
             self._tools = collected
             self._tools_at = time.monotonic()
             return collected
@@ -159,16 +202,51 @@ class MCPPool:
 
     # -- invocation ---------------------------------------------------------
 
+    def _schema_for(self, qualified_name: str) -> dict[str, Any]:
+        for tool in self._tools or []:
+            if tool.qualified_name == qualified_name:
+                return tool.input_schema
+        return {}
+
+    async def _invoke(self, url: str, http: httpx2.AsyncClient, tool: str, arguments):
+        async with Client(streamable_http_client(url, http_client=http)) as client:
+            return await client.call_tool(tool, arguments)
+
     async def call_tool(self, qualified_name: str, arguments: dict[str, Any]) -> ToolResult:
         server, tool = split_qualified(qualified_name)
+        cfg = self._servers.get(server)
+        if cfg is None:
+            raise MCPError(f"unknown MCP server {server!r}; configured: {sorted(self._servers)}")
+
+        # The schema is what tells us which arguments need Mcp-Param headers, so the
+        # catalog has to exist before the first call. The loop always builds it first,
+        # but a caller that does not would otherwise silently send no headers and hit
+        # the same 400 this method exists to prevent.
+        if self._tools is None:
+            await self.list_tools()
+        extra = header_params(self._schema_for(qualified_name), arguments)
+
         try:
-            async with self._session(server) as client:
-                result = await client.call_tool(tool, arguments)
+            if extra:
+                # These headers vary per call, so the pooled client cannot carry them;
+                # a short-lived client is the price of correctness here.
+                async with httpx2.AsyncClient(
+                    headers={**cfg.headers, **extra},
+                    timeout=httpx2.Timeout(30.0, read=self._timeout),
+                    follow_redirects=True,
+                ) as http:
+                    result = await self._invoke(cfg.url, http, tool, arguments)
+            else:
+                http = self._http.get(server)
+                if http is None:
+                    raise MCPError("MCPPool.start() was not called")
+                result = await self._invoke(cfg.url, http, tool, arguments)
         except Exception as exc:
             # Transport-level failure. Surface it as a tool result rather than an
             # exception so the loop can let the model react instead of dying.
-            logger.warning("mcp call %s failed: %s", qualified_name, exc)
-            return ToolResult(ok=False, text=f"tool transport error: {exc}")
+            detail = explain_exception(exc)
+            logger.warning("mcp call %s failed: %s", qualified_name, detail)
+            return ToolResult(ok=False, text=f"tool transport error: {detail}")
 
         text = _flatten_content(result.content)
         return ToolResult(

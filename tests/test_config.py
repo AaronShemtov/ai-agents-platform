@@ -77,3 +77,12 @@ def test_unset_mcp_servers_are_omitted() -> None:
         mcp_cluster_url="http://mcp-cluster:8080/mcp",
     )
     assert set(settings.mcp_endpoints()) == {"github", "cluster"}
+
+
+def test_responses_api_models_parse() -> None:
+    settings = Settings(models_responses_api="gpt-5.3-codex, gpt-5.1-codex-max")
+    assert settings.responses_api_models() == {"gpt-5.3-codex", "gpt-5.1-codex-max"}
+
+
+def test_no_responses_models_means_everything_uses_chat_completions() -> None:
+    assert Settings(models_responses_api="").responses_api_models() == set()

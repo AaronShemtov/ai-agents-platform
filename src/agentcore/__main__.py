@@ -75,6 +75,7 @@ async def amain() -> int:
     llm = AzureFoundryClient(
         base_url=settings.base_url(),
         api_key=settings.azure_openai_api_key,
+        responses_models=settings.responses_api_models(),
     )
 
     pool = MCPPool(

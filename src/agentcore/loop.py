@@ -26,6 +26,7 @@ from typing import Any
 
 from agentcore.audit import AuditLog, Timer
 from agentcore.config import Settings
+from agentcore.llm.azure import RAW_OUTPUT_KEY
 from agentcore.llm.base import LLMClient, LLMError, ToolCall, Usage
 from agentcore.mcp.client import MCPPool
 from agentcore.mcp.toolset import ToolCatalog, build_catalog
@@ -165,6 +166,15 @@ class AgentLoop:
                     **(
                         {"tool_calls": [_serialise_call(c) for c in response.tool_calls]}
                         if response.tool_calls
+                        else {}
+                    ),
+                    # A Responses model returns reasoning items alongside its tool call,
+                    # and they have to be replayed on the next request or the model loses
+                    # its own chain of thought between steps. Carried verbatim; stripped
+                    # again before anything reaches /chat/completions.
+                    **(
+                        {RAW_OUTPUT_KEY: response.raw_message[RAW_OUTPUT_KEY]}
+                        if RAW_OUTPUT_KEY in response.raw_message
                         else {}
                     ),
                 }

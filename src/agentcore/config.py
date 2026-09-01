@@ -57,6 +57,11 @@ class Settings(BaseSettings):
     azure_openai_api_key: str = ""
     model_default: str = "gpt-5-mini"
     model_allowlist: str = ""  # comma-separated
+    # Deployments that answer only on /responses. Configuration rather than a guess
+    # from the model name, so a new deployment is a ConfigMap edit and not a release.
+    # The codex line rejects /chat/completions with HTTP 400 by design — see
+    # agentcore.llm.azure.
+    models_responses_api: str = ""  # comma-separated
 
     # --- Telegram ----------------------------------------------------------
     telegram_bot_token: str = ""
@@ -124,6 +129,10 @@ class Settings(BaseSettings):
             "cluster": self.mcp_cluster_url,
         }
         return {name: url for name, url in candidates.items() if url}
+
+    def responses_api_models(self) -> set[str]:
+        """Deployments to call over /responses instead of /chat/completions."""
+        return set(_split(self.models_responses_api))
 
     def allowed_models(self) -> list[str]:
         """Models selectable via /model, always including the default."""

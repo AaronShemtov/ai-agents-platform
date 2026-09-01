@@ -30,6 +30,7 @@ this every GitHub tool taking a repository was unusable — which is most of the
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import time
 from dataclasses import dataclass, field
@@ -270,7 +271,44 @@ def _flatten_content(content: Any) -> str:
         if text:
             parts.append(text)
             continue
-        # Non-text blocks (images, resources) are summarised rather than dropped, so
+        resolved = _resource_text(getattr(block, "resource", None))
+        if resolved is not None:
+            parts.append(resolved)
+            continue
+        # Anything still unhandled (an image, say) is summarised rather than dropped, so
         # the model at least knows something came back.
         parts.append(f"({getattr(block, 'type', 'unknown')} content block)")
     return "\n".join(parts)
+
+
+def _resource_text(resource: Any) -> str | None:
+    """The payload of an embedded resource block, or None if this is not one.
+
+    The GitHub server answers get_file_contents with two blocks: a text one saying the
+    download succeeded, and the file itself as an embedded resource. Summarising that
+    second block as "(resource content block)" hands the model a confirmation carrying
+    no content — and a model asked what is in a file it was just told it downloaded
+    answers from nothing rather than saying it saw nothing. That is not hypothetical:
+    the first file the coder agent was asked to read, it reported on confidently and
+    wrongly.
+    """
+    if resource is None:
+        return None
+
+    text = getattr(resource, "text", None)
+    if text is not None:
+        return str(text)
+
+    blob = getattr(resource, "blob", None)
+    if blob is None:
+        return None
+
+    try:
+        raw = base64.b64decode(blob, validate=True)
+    except (ValueError, TypeError):
+        return "(resource with an undecodable payload)"
+    try:
+        return raw.decode("utf-8")
+    except UnicodeDecodeError:
+        mime = getattr(resource, "mimeType", None) or "unknown type"
+        return f"(binary resource, {mime}, {len(raw)} bytes)"

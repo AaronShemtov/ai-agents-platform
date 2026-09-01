@@ -82,13 +82,24 @@ class AgentLoop:
 
     @property
     def max_tokens(self) -> int:
-        """Approximate input-context budget used when trimming chat history.
+        """Input-context budget used when trimming chat history.
 
-        This is not a cumulative per-turn usage cap: prompt tokens are counted again
-        on every agent step, so summing them and comparing with this value caused
-        healthy multi-step tasks to stop with a false token-limit message.
+        NOT a cumulative per-turn spend cap. Prompt tokens are counted again on every
+        step of the loop, so summing them and comparing against this value stopped
+        healthy multi-step tasks with a false token-limit message. `max_billable` is
+        the limit that answers the cost question.
         """
         return self._profile.max_tokens_per_turn or self._settings.max_tokens_per_turn
+
+    @property
+    def max_billable(self) -> int:
+        """Spend ceiling for one turn, in tokens that actually cost money.
+
+        Excludes the cached prefix — see Usage.billable. A thirty-step turn at a 95%
+        cache hit rate lands around 33k, so this is a backstop against a pathological
+        turn (huge tool outputs, a cold cache), not a limit ordinary work should meet.
+        """
+        return self._settings.max_billable_tokens_per_turn
 
     async def catalog(self, *, force_refresh: bool = False) -> ToolCatalog:
         tools = await self._pool.list_tools(force_refresh=force_refresh)
@@ -118,6 +129,18 @@ class AgentLoop:
             if cancel is not None and cancel.is_set():
                 stopped = "cancelled"
                 answer = answer or "Отменено."
+                break
+
+            # A cost ceiling, measured against max_billable rather than max_tokens:
+            # the two limits answer different questions. See both properties.
+            if usage.billable > self.max_billable:
+                stopped = "token_budget"
+                answer = answer or (
+                    f"Остановился на лимите бюджета: {usage.billable} оплачиваемых "
+                    f"токенов за {steps} шагов при лимите {self.max_billable}. "
+                    "Задача оказалась объёмнее ожидаемого. Разбей её на части "
+                    "или скажи продолжать — возьмусь за остаток отдельным запросом."
+                )
                 break
 
             steps += 1
@@ -185,10 +208,14 @@ class AgentLoop:
             prompt_tokens=usage.prompt_tokens,
             completion_tokens=usage.completion_tokens,
             cached_tokens=usage.cached_tokens,
+            reasoning_tokens=usage.reasoning_tokens,
+            billable_tokens=usage.billable,
             duration_ms=int((time.monotonic() - started) * 1000),
             stopped_because=stopped,
         )
         return LoopResult(text=answer, steps=steps, usage=usage, stopped_because=stopped)
+
+    # -- one tool call -------------------------------------------------------
 
     async def _execute(
         self,
@@ -201,6 +228,7 @@ class AgentLoop:
     ) -> str:
         qualified = catalog.resolve(call.name)
         if qualified is None:
+            # The model invented a tool, or called one filtered out by the profile.
             audit.denied(tool=call.name, reason="unknown tool")
             return f"error: инструмента {call.name} не существует. Доступные: {catalog.names()}"
 
@@ -221,8 +249,10 @@ class AgentLoop:
                     tool=qualified, arguments=call.arguments, decision="rejected", ok=False
                 )
                 return (
-                    "denied by local policy, not by the remote service: "
-                    "пользователь отклонил это действие"
+                    "denied by local policy, not by the remote service: пользователь "
+                    "нажал «Отклонить». Запрос никуда не отправлялся, ничего не "
+                    "изменилось. Это решение пользователя, а не сбой — не предлагай "
+                    "повторить тот же вызов с теми же аргументами."
                 )
 
         await progress(f"🔧 {qualified}")
@@ -242,7 +272,12 @@ class AgentLoop:
 
 
 def _serialise_call(call: ToolCall) -> dict[str, Any]:
-    """Rebuild the tool_call entry for the transcript."""
+    """Rebuild the tool_call entry for the transcript.
+
+    Built explicitly rather than echoing the provider's raw message: the raw object
+    carries extra fields (refusal, annotations, audio) that some endpoints reject
+    when handed straight back.
+    """
     return {
         "id": call.id,
         "type": "function",

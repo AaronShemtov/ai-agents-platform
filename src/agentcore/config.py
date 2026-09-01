@@ -85,7 +85,12 @@ class Settings(BaseSettings):
 
     # --- limits ------------------------------------------------------------
     max_steps: int = 30
+    # How much transcript is sent on a single step.
     max_tokens_per_turn: int = 120_000
+    # Spend ceiling for one turn, counting only tokens outside the cached prefix.
+    # A thirty-step turn costs roughly 33k of these, so this is a backstop, not a
+    # limit ordinary work should ever meet.
+    max_billable_tokens_per_turn: int = 200_000
     tool_timeout_seconds: float = 120.0
 
     # --- process -----------------------------------------------------------

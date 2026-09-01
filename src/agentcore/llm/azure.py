@@ -80,10 +80,14 @@ class AzureFoundryClient:
         # prompt_tokens_details.cached_tokens is present on Azure but absent on some
         # deployments and older API shapes, hence the defensive getattr chain.
         details = getattr(resp.usage, "prompt_tokens_details", None)
+        out_details = getattr(resp.usage, "completion_tokens_details", None)
         usage = Usage(
             prompt_tokens=getattr(resp.usage, "prompt_tokens", 0) or 0,
             completion_tokens=getattr(resp.usage, "completion_tokens", 0) or 0,
             cached_tokens=getattr(details, "cached_tokens", 0) or 0,
+            # Billed as output and invisible in the reply, so without this the cost of a
+            # reasoning model cannot be told apart from the cost of a chatty one.
+            reasoning_tokens=getattr(out_details, "reasoning_tokens", 0) or 0,
         )
 
         return LLMResponse(

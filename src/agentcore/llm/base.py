@@ -28,10 +28,25 @@ class Usage:
     # input should be cache hits. A hit rate near zero means something is perturbing
     # the prefix and every step is being paid for in full.
     cached_tokens: int = 0
+    # Hidden thinking, billed as output. Measured 2026-09-01 on this resource: the
+    # gpt-5.6 family spends ~10-14 on a routine tool-selection step, gpt-5-mini ~128.
+    reasoning_tokens: int = 0
 
     @property
     def total(self) -> int:
         return self.prompt_tokens + self.completion_tokens
+
+    @property
+    def billable(self) -> int:
+        """Tokens that carry real cost, for budgeting a turn.
+
+        `total` is the wrong measure for a per-turn budget. The system prompt and the
+        tool definitions — some 12k tokens — are re-sent on every step of the loop, and
+        at a 95% cache hit rate they are charged at roughly a tenth of the input rate.
+        Counting them at full weight made the budget trip after nine or ten steps while
+        max_steps allowed thirty, which read to the user as a mysterious "token limit".
+        """
+        return max(0, self.prompt_tokens - self.cached_tokens) + self.completion_tokens
 
     @property
     def cache_hit_pct(self) -> int:
@@ -42,6 +57,7 @@ class Usage:
             self.prompt_tokens + other.prompt_tokens,
             self.completion_tokens + other.completion_tokens,
             self.cached_tokens + other.cached_tokens,
+            self.reasoning_tokens + other.reasoning_tokens,
         )
 
 

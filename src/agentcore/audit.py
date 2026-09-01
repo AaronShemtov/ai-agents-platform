@@ -89,6 +89,8 @@ class AuditLog:
         duration_ms: int,
         stopped_because: str,
         cached_tokens: int = 0,
+        reasoning_tokens: int = 0,
+        billable_tokens: int = 0,
     ) -> None:
         self._log.info(
             "turn",
@@ -97,6 +99,8 @@ class AuditLog:
             prompt_tokens=prompt_tokens,
             completion_tokens=completion_tokens,
             cached_tokens=cached_tokens,
+            reasoning_tokens=reasoning_tokens,
+            billable_tokens=billable_tokens,
             cache_hit_pct=round(100 * cached_tokens / prompt_tokens) if prompt_tokens else 0,
             total_tokens=prompt_tokens + completion_tokens,
             duration_ms=duration_ms,

@@ -100,16 +100,21 @@ class Policy:
         if server == "cloudflare":
             return self._cloudflare(bare)
         if server == "cluster":
+            # The ClusterRole makes writes impossible anyway; refusing here gives the
+            # model a clear explanation instead of an opaque 403 from the apiserver.
             return Verdict(
                 Decision.DENY,
                 "кластер только на чтение: он управляется через GitOps. "
                 "Чтобы изменить кластер, отредактируй манифесты в personal-k8s и открой PR.",
             )
 
+        # Unknown namespace: gate rather than guess.
         return Verdict(
             Decision.REQUIRE_APPROVAL,
             f"инструмент {qualified_name} не относится к известным пространствам имён",
         )
+
+    # -- per-namespace rules -------------------------------------------------
 
     def _github(self, bare: str, arguments: dict[str, Any]) -> Verdict:
         mode = self._s.github_write_mode
@@ -119,8 +124,11 @@ class Policy:
 
         repo = _arg(arguments, _REPO_KEYS)
         branch = _arg(arguments, _BRANCH_KEYS)
+        # A missing branch means the tool acts on the repository default branch.
         targets_default = branch is None or branch.lower() in DEFAULT_BRANCHES
 
+        # Protected repos: writable, but only through a pull request. This
+        # survives direct-push mode on purpose.
         if repo and repo.lower() in self._protected and targets_default:
             if bare.startswith(("create_pull_request", "create_branch")):
                 return Verdict(Decision.ALLOW)
@@ -147,6 +155,8 @@ class Policy:
             )
         if mode is WriteMode.AUTO:
             return Verdict(Decision.ALLOW)
+        # Default: APPROVE. A bad commit is revertible; a deleted DNS record takes
+        # 1ms.my offline until someone notices.
         return Verdict(
             Decision.REQUIRE_APPROVAL,
             f"изменение в Cloudflare ({bare}) требует подтверждения",

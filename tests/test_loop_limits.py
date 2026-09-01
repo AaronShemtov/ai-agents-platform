@@ -45,7 +45,7 @@ class FakePolicy:
         return SimpleNamespace(decision=Decision.ALLOW, reason="")
 
 
-def make_loop(responses, *, max_tokens=10, max_steps=5):
+def make_loop(responses, *, max_tokens=10, max_steps=5, max_billable=200_000):
     profile = SimpleNamespace(
         max_steps=max_steps,
         max_tokens_per_turn=max_tokens,
@@ -54,7 +54,11 @@ def make_loop(responses, *, max_tokens=10, max_steps=5):
     )
     loop = AgentLoop(
         profile=profile,
-        settings=Settings(max_steps=max_steps, max_tokens_per_turn=max_tokens),
+        settings=Settings(
+            max_steps=max_steps,
+            max_tokens_per_turn=max_tokens,
+            max_billable_tokens_per_turn=max_billable,
+        ),
         llm=FakeLLM(responses),
         pool=FakePool(),
         policy=FakePolicy(),
@@ -152,3 +156,47 @@ def test_tool_result_is_clipped_with_explicit_count():
     assert len(clipped) < len(text)
     assert clipped.startswith("x" * MAX_TOOL_RESULT_CHARS)
     assert "обрезано 37 символов" in clipped
+
+
+# -- the spend ceiling -------------------------------------------------------
+#
+# The two limits above and below answer different questions, and conflating them is
+# what produced the false "token limit" message in the first place. max_tokens_per_turn
+# bounds how much transcript goes out on one step; max_billable_tokens_per_turn bounds
+# what a whole turn is allowed to cost. The test above proves the first no longer stops
+# healthy work; these prove the second still stops runaway work.
+
+
+def test_the_spend_ceiling_still_stops_a_runaway_turn():
+    expensive = LLMResponse(
+        content=None,
+        tool_calls=[ToolCall(id="1", name="test_tool", arguments={})],
+        usage=Usage(prompt_tokens=5_000, completion_tokens=1_000),
+        finish_reason="tool_calls",
+    )
+    loop = make_loop([expensive] * 5, max_steps=5, max_billable=8_000)
+
+    result, audit = run(loop)
+
+    assert result.stopped_because == "token_budget"
+    assert audit.stop_reason == "token_budget"
+    # The message must name the numbers; "достиг лимита" alone sent the user to me.
+    assert str(loop.max_billable) in result.text
+
+
+def test_the_cached_prefix_does_not_count_against_the_spend_ceiling():
+    """The actual shape of a real step: 12k prompt, 95% of it served from cache."""
+    step = LLMResponse(
+        content=None,
+        tool_calls=[ToolCall(id="1", name="test_tool", arguments={})],
+        usage=Usage(prompt_tokens=12_000, completion_tokens=500, cached_tokens=11_400),
+        finish_reason="tool_calls",
+    )
+    done = LLMResponse(content="done", usage=Usage(prompt_tokens=12_000, cached_tokens=11_400))
+    # Raw totals reach ~75k across six steps; billable stays near 6k.
+    loop = make_loop([step] * 5 + [done], max_steps=10, max_billable=20_000)
+
+    result, _audit = run(loop)
+
+    assert result.stopped_because == "completed"
+    assert result.text == "done"

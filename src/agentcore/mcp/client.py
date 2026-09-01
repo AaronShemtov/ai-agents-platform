@@ -53,6 +53,10 @@ class MCPServerConfig:
     # field in its own config and rejects unauthenticated requests with 401, so the
     # PAT has to travel as a per-request header from here.
     headers: dict[str, str] = field(default_factory=dict)
+    # Read timeout for this server alone. A delegated agent runs its own tool loop and
+    # can legitimately take minutes, where a DNS lookup should never take ten seconds.
+    # None means the pool default.
+    timeout: float | None = None
 
 
 @dataclass(frozen=True)
@@ -137,7 +141,7 @@ class MCPPool:
         for name, cfg in self._servers.items():
             self._http[name] = httpx2.AsyncClient(
                 headers=cfg.headers,
-                timeout=httpx2.Timeout(30.0, read=self._timeout),
+                timeout=httpx2.Timeout(30.0, read=cfg.timeout or self._timeout),
                 follow_redirects=True,
             )
 
@@ -232,7 +236,7 @@ class MCPPool:
                 # a short-lived client is the price of correctness here.
                 async with httpx2.AsyncClient(
                     headers={**cfg.headers, **extra},
-                    timeout=httpx2.Timeout(30.0, read=self._timeout),
+                    timeout=httpx2.Timeout(30.0, read=cfg.timeout or self._timeout),
                     follow_redirects=True,
                 ) as http:
                     result = await self._invoke(cfg.url, http, tool, arguments)

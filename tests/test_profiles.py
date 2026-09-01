@@ -74,3 +74,27 @@ def test_deny_applies_even_with_an_empty_allow_list() -> None:
 def test_empty_system_prompt_is_rejected() -> None:
     with pytest.raises(ValueError, match="system_prompt"):
         make_profile(system_prompt="   ")
+
+
+def test_coder_has_no_cloudflare(agents_dir: Path) -> None:
+    """Cloudflare's write mode is `approve` and a worker agent has no one to ask.
+
+    Giving it those tools would only produce refusals at the point of use, so the
+    absence is deliberate and worth pinning.
+    """
+    coder = load_profile("coder", agents_dir)
+    assert "cloudflare" not in coder.mcp_servers
+    assert not coder.tool_allowed("cloudflare__create_dns_record")
+
+
+def test_coder_pins_its_own_model(agents_dir: Path) -> None:
+    """The lead inherits MODEL_DEFAULT; the coder is chosen on measurement."""
+    coder = load_profile("coder", agents_dir)
+    assert coder.model == "gpt-5.3-codex"
+    assert load_profile("lead", agents_dir).model is None
+
+
+def test_lead_can_reach_the_coder(agents_dir: Path) -> None:
+    lead = load_profile("lead", agents_dir)
+    assert "coder" in lead.mcp_servers
+    assert lead.tool_allowed("coder__ask")

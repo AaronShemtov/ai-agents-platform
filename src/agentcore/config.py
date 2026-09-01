@@ -73,6 +73,9 @@ class Settings(BaseSettings):
     mcp_github_url: str = ""
     mcp_cloudflare_url: str = ""
     mcp_cluster_url: str = ""
+    # A worker agent exposed as an MCP server — see src/mcp_agent. Empty means this
+    # deployment has no one to delegate to.
+    mcp_coder_url: str = ""
 
     # The official GitHub MCP server in `http` mode has NO token field: it requires
     # `Authorization: Bearer <PAT>` on every request. So the PAT lives here, in the
@@ -97,6 +100,9 @@ class Settings(BaseSettings):
     # limit ordinary work should ever meet.
     max_billable_tokens_per_turn: int = 200_000
     tool_timeout_seconds: float = 120.0
+    # A delegated agent runs a whole tool loop of its own before answering, so it needs
+    # far longer than an ordinary tool call.
+    agent_tool_timeout_seconds: float = 900.0
 
     # --- process -----------------------------------------------------------
     health_port: int = 8080
@@ -127,6 +133,7 @@ class Settings(BaseSettings):
             "github": self.mcp_github_url,
             "cloudflare": self.mcp_cloudflare_url,
             "cluster": self.mcp_cluster_url,
+            "coder": self.mcp_coder_url,
         }
         return {name: url for name, url in candidates.items() if url}
 

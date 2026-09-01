@@ -86,3 +86,17 @@ def test_responses_api_models_parse() -> None:
 
 def test_no_responses_models_means_everything_uses_chat_completions() -> None:
     assert Settings(models_responses_api="").responses_api_models() == set()
+
+
+def test_the_coder_endpoint_joins_the_other_servers() -> None:
+    settings = Settings(
+        mcp_github_url="http://mcp-github:8082/",
+        mcp_coder_url="http://agent-coder:8080/mcp",
+    )
+    assert set(settings.mcp_endpoints()) == {"github", "coder"}
+
+
+def test_a_delegate_gets_far_longer_than_an_ordinary_tool_call() -> None:
+    """A delegated agent runs a whole loop before answering; 120s would cut it off."""
+    settings = Settings()
+    assert settings.agent_tool_timeout_seconds > settings.tool_timeout_seconds

@@ -38,6 +38,7 @@ packages = [
     "src/mcp_common",
     "src/mcp_cloudflare",
     "src/mcp_cluster",
+    "src/mcp_agent",
 ]
 
 [tool.pytest.ini_options]

@@ -48,7 +48,16 @@ def build_mcp_servers(settings: Settings, profile_servers: list[str]) -> list[MC
             else:
                 headers["Authorization"] = f"Bearer {settings.github_pat}"
 
-        servers.append(MCPServerConfig(name=name, url=url, headers=headers))
+        servers.append(
+            MCPServerConfig(
+                name=name,
+                url=url,
+                headers=headers,
+                # A delegated agent answers only after running its own loop, so the
+                # ordinary tool timeout would cut it off mid-task.
+                timeout=settings.agent_tool_timeout_seconds if name == "coder" else None,
+            )
+        )
 
     return servers
 

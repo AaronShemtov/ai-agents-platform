@@ -23,7 +23,7 @@ from typing import Any
 
 from agentcore.audit import AuditLog, configure_logging
 from agentcore.config import Settings, get_settings
-from agentcore.llm.azure import AzureFoundryClient
+from agentcore.llm.router import build_llm
 from agentcore.loop import AgentLoop
 from agentcore.mcp.client import MCPPool, MCPServerConfig
 from agentcore.memory import ChatMemory
@@ -104,11 +104,7 @@ class AgentService:
                 self._loop = AgentLoop(
                     profile=self._profile,
                     settings=self._settings,
-                    llm=AzureFoundryClient(
-                        base_url=self._settings.base_url(),
-                        api_key=self._settings.azure_openai_api_key,
-                        responses_models=self._settings.responses_api_models(),
-                    ),
+                    llm=build_llm(self._settings),
                     pool=pool,
                     policy=Policy(self._settings),
                 )

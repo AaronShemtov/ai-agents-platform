@@ -57,23 +57,38 @@ RAW_OUTPUT_KEY = "_raw_output"
 
 
 class AzureFoundryClient:
+    """Azure AI Foundry, and anything else speaking the same wire protocol.
+
+    The name says who the main user is, not what the class is limited to: everything
+    below is the OpenAI wire protocol, so a self-hosted Ollama at <host>:11434/v1/ is
+    served by this same class with a different base_url and an empty `responses_models`
+    — Ollama implements /chat/completions and not /responses. The Azure-specific
+    knowledge is in the module docstring above, which is why it stays in this file.
+
+    `label` only names the settings in the two startup errors, so a misconfigured
+    Ollama does not report a missing AZURE_OPENAI_BASE_URL.
+    """
+
     def __init__(
         self,
         *,
         base_url: str,
         api_key: str,
         responses_models: set[str] | None = None,
+        headers: dict[str, str] | None = None,
         timeout: float = 180.0,
         max_retries: int = 3,
+        label: str = "AZURE_OPENAI",
     ) -> None:
         if not base_url:
-            raise LLMError("AZURE_OPENAI_BASE_URL is not set")
+            raise LLMError(f"{label}_BASE_URL is not set")
         if not api_key:
-            raise LLMError("AZURE_OPENAI_API_KEY is not set")
+            raise LLMError(f"{label}_API_KEY is not set")
         self._responses_models = responses_models or set()
         self._client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
+            default_headers=headers or None,
             timeout=timeout,
             max_retries=max_retries,
         )

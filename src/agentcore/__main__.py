@@ -17,7 +17,7 @@ import sys
 from agentcore.audit import configure_logging
 from agentcore.config import Settings, get_settings
 from agentcore.health import build_health_app, build_health_server
-from agentcore.llm.azure import AzureFoundryClient
+from agentcore.llm.router import build_llm
 from agentcore.loop import AgentLoop
 from agentcore.mcp.client import MCPPool, MCPServerConfig
 from agentcore.memory import MemoryStore
@@ -81,11 +81,7 @@ async def amain() -> int:
         logger.error("TELEGRAM_ALLOWED_USERS is empty; the bot would refuse every user")
         return 2
 
-    llm = AzureFoundryClient(
-        base_url=settings.base_url(),
-        api_key=settings.azure_openai_api_key,
-        responses_models=settings.responses_api_models(),
-    )
+    llm = build_llm(settings)
 
     pool = MCPPool(
         build_mcp_servers(settings, profile.mcp_servers),

@@ -13,6 +13,7 @@ from enum import StrEnum
 from functools import lru_cache
 from pathlib import Path
 
+from pydantic import model_validator
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
 
@@ -62,6 +63,23 @@ class Settings(BaseSettings):
     # The codex line rejects /chat/completions with HTTP 400 by design — see
     # agentcore.llm.azure.
     models_responses_api: str = ""  # comma-separated
+
+    # --- Ollama (self-hosted, OpenAI-compatible) ---------------------------
+    # Ollama serves the OpenAI wire protocol at <host>:11434/v1/, so it needs no client
+    # of its own. What it does not serve is /responses — see the validator below.
+    ollama_base_url: str = ""
+    models_ollama: str = ""  # comma-separated
+    # Ollama ignores the key, but the OpenAI SDK refuses to construct without one.
+    # Overridable in case something that does check it sits in front.
+    ollama_api_key: str = "ollama"
+    # JSON, unlike the comma-separated fields above, and deliberately so: these are
+    # credentials for whatever gates the endpoint — Cloudflare Access sends two headers
+    # — and a secret may well contain a comma. A dict field is precisely the case
+    # pydantic-settings' JSON parsing is for.
+    ollama_headers: dict[str, str] = {}
+    # Local inference is slow, and on CPU the whole prompt must be ingested before the
+    # first token appears. Azure's 180s would time out on a long input.
+    ollama_timeout_seconds: float = 600.0
 
     # --- Telegram ----------------------------------------------------------
     telegram_bot_token: str = ""
@@ -147,6 +165,36 @@ class Settings(BaseSettings):
         if self.model_default and self.model_default not in models:
             models.insert(0, self.model_default)
         return models
+
+    def ollama_url(self) -> str:
+        """Ollama's OpenAI-compatible endpoint, always with a trailing slash."""
+        return self.ollama_base_url.rstrip("/") + "/" if self.ollama_base_url else ""
+
+    def ollama_models(self) -> set[str]:
+        """Models to route to Ollama rather than to Azure."""
+        return set(_split(self.models_ollama))
+
+    @model_validator(mode="after")
+    def _ollama_routing_is_coherent(self) -> Settings:
+        """Refuse the two misconfigurations that would otherwise fail mid-conversation.
+
+        Both produce errors that point nowhere near the cause: an unrouted local model
+        reaches Azure as an unknown deployment, and an Ollama model asked for /responses
+        gets a bare 404 from a path Ollama does not implement.
+        """
+        local = set(_split(self.models_ollama))
+        if local and not self.ollama_base_url:
+            raise ValueError(
+                f"MODELS_OLLAMA lists {sorted(local)} but OLLAMA_BASE_URL is empty, "
+                "so those names would be sent to Azure as deployment names"
+            )
+        clash = local & set(_split(self.models_responses_api))
+        if clash:
+            raise ValueError(
+                f"{sorted(clash)} appear in both MODELS_OLLAMA and MODELS_RESPONSES_API; "
+                "Ollama serves /chat/completions only"
+            )
+        return self
 
 
 def _split(raw: str) -> list[str]:

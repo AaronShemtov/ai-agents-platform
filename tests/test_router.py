@@ -140,6 +140,59 @@ def test_headers_are_json_because_a_secret_may_contain_a_comma() -> None:
     assert settings.ollama_headers["CF-Access-Client-Secret"] == "s,e=c"
 
 
+# -- thinking ----------------------------------------------------------------
+#
+# These reach into _extra_params on purpose. What is being pinned is that the parameter
+# is sent at all: it is the only way to stop a reasoning model on Ollama from spending a
+# minute per step, and nothing else in the suite would notice if it silently stopped
+# being passed.
+
+
+def test_a_local_reasoning_model_is_told_not_to_think() -> None:
+    llm = build_llm(
+        Settings(**AZURE, ollama_base_url="https://ollama.example/v1", models_ollama="qwen3.5:0.8b")
+    )
+    assert isinstance(llm, ModelRouter)
+    local = llm.backend_for("qwen3.5:0.8b").client
+    assert local._extra_params == {"reasoning_effort": "none"}  # type: ignore[attr-defined]
+
+
+def test_thinking_can_be_turned_back_on_per_deployment() -> None:
+    llm = build_llm(
+        Settings(
+            **AZURE,
+            ollama_base_url="https://ollama.example/v1",
+            models_ollama="qwen3.5:0.8b",
+            ollama_reasoning_effort="low",
+        )
+    )
+    assert isinstance(llm, ModelRouter)
+    local = llm.backend_for("qwen3.5:0.8b").client
+    assert local._extra_params == {"reasoning_effort": "low"}  # type: ignore[attr-defined]
+
+
+def test_an_empty_effort_sends_nothing_at_all() -> None:
+    """Not the string "none" — no key, so the model's own default stands."""
+    llm = build_llm(
+        Settings(
+            **AZURE,
+            ollama_base_url="https://ollama.example/v1",
+            models_ollama="qwen3.5:0.8b",
+            ollama_reasoning_effort="",
+        )
+    )
+    assert isinstance(llm, ModelRouter)
+    local = llm.backend_for("qwen3.5:0.8b").client
+    assert local._extra_params == {}  # type: ignore[attr-defined]
+
+
+def test_azure_requests_are_left_alone() -> None:
+    """Ollama's knob must not follow the hosted models around."""
+    llm = build_llm(Settings(**AZURE))
+    assert isinstance(llm, AzureFoundryClient)
+    assert llm._extra_params == {}  # type: ignore[attr-defined]
+
+
 def test_the_endpoint_always_ends_in_a_slash() -> None:
     settings = Settings(**AZURE, ollama_base_url="http://box:11434/v1")
     assert settings.ollama_url() == "http://box:11434/v1/"

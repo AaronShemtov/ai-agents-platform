@@ -80,6 +80,18 @@ class Settings(BaseSettings):
     # Local inference is slow, and on CPU the whole prompt must be ingested before the
     # first token appears. Azure's 180s would time out on a long input.
     ollama_timeout_seconds: float = 600.0
+    # Reasoning models on Ollama think by default, and on four CPU cores that is the
+    # difference between a second and a minute. Measured 2026-09-03 on qwen3.5:0.8b,
+    # "say ready": thinking on, 11s and 427 completion tokens; off, 1s and 28.
+    #
+    # reasoning_effort is the ONLY lever that reaches it over /v1. Also measured, all
+    # on the same box: Ollama silently ignores `think: false` there (it works on the
+    # native /api/chat), ignores `chat_template_kwargs.enable_thinking` — which made it
+    # worse, 45s — rejects `PARAMETER think` in a Modelfile outright, and Qwen3.5 no
+    # longer honours `/no_think` in the prompt the way Qwen3 did.
+    #
+    # Raise it to low/medium per deployment for a role that genuinely benefits.
+    ollama_reasoning_effort: str = "none"
 
     # --- Telegram ----------------------------------------------------------
     telegram_bot_token: str = ""

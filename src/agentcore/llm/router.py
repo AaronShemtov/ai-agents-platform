@@ -83,6 +83,13 @@ def build_llm(settings: Settings) -> LLMClient:
             # silently disagree with configuration.
             responses_models=set(),
             headers=settings.ollama_headers,
+            # Empty string means "send nothing and take the model's default", which is
+            # how a deployment opts back into thinking.
+            extra_params=(
+                {"reasoning_effort": settings.ollama_reasoning_effort}
+                if settings.ollama_reasoning_effort
+                else {}
+            ),
             timeout=settings.ollama_timeout_seconds,
             label="OLLAMA",
         ),

@@ -76,6 +76,7 @@ class AzureFoundryClient:
         api_key: str,
         responses_models: set[str] | None = None,
         headers: dict[str, str] | None = None,
+        extra_params: dict[str, Any] | None = None,
         timeout: float = 180.0,
         max_retries: int = 3,
         label: str = "AZURE_OPENAI",
@@ -85,6 +86,10 @@ class AzureFoundryClient:
         if not api_key:
             raise LLMError(f"{label}_API_KEY is not set")
         self._responses_models = responses_models or set()
+        # Merged into every request. The one thing this is actually for: a reasoning
+        # model served by Ollama needs reasoning_effort="none", and that is a property
+        # of the backend rather than of any single call.
+        self._extra_params = dict(extra_params or {})
         self._client = AsyncOpenAI(
             base_url=base_url,
             api_key=api_key,
@@ -116,7 +121,11 @@ class AzureFoundryClient:
         messages: list[dict[str, Any]],
         tools: list[dict[str, Any]] | None,
     ) -> LLMResponse:
-        kwargs: dict[str, Any] = {"model": model, "messages": strip_internal(messages)}
+        kwargs: dict[str, Any] = {
+            "model": model,
+            "messages": strip_internal(messages),
+            **self._extra_params,
+        }
         # An empty `tools` array is rejected by the API — omit the key entirely when
         # the agent has no tools rather than sending [].
         if tools:
@@ -172,7 +181,7 @@ class AzureFoundryClient:
         tools: list[dict[str, Any]] | None,
     ) -> LLMResponse:
         instructions, items = to_responses_input(messages)
-        kwargs: dict[str, Any] = {"model": model, "input": items}
+        kwargs: dict[str, Any] = {"model": model, "input": items, **self._extra_params}
         if instructions:
             kwargs["instructions"] = instructions
         if tools:

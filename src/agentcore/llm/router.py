@@ -82,7 +82,7 @@ def build_llm(settings: Settings) -> LLMClient:
             # listed in both MODELS_OLLAMA and MODELS_RESPONSES_API, so this cannot
             # silently disagree with configuration.
             responses_models=set(),
-            headers=settings.ollama_headers,
+            headers=settings.ollama_request_headers(),
             # Empty string means "send nothing and take the model's default", which is
             # how a deployment opts back into thinking.
             extra_params=(

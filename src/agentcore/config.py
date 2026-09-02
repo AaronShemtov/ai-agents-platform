@@ -77,6 +77,15 @@ class Settings(BaseSettings):
     # — and a secret may well contain a comma. A dict field is precisely the case
     # pydantic-settings' JSON parsing is for.
     ollama_headers: dict[str, str] = {}
+    # The ordinary case, and the reason it is not just the dict above: a single shared
+    # secret in front of the endpoint. Splitting it into a plain header name and an
+    # opaque value means what goes into the vault is a random string rather than a JSON
+    # document a person has to keep well-formed — a lost quote there is a
+    # CrashLoopBackOff, because pydantic-settings parses this before anything runs.
+    # Both are merged; use ollama_headers for a gate needing several headers, such as a
+    # Cloudflare Access service token.
+    ollama_auth_header: str = "X-Agent-Key"
+    ollama_auth_token: str = ""
     # Local inference is slow, and on CPU the whole prompt must be ingested before the
     # first token appears. Azure's 180s would time out on a long input.
     ollama_timeout_seconds: float = 600.0
@@ -185,6 +194,17 @@ class Settings(BaseSettings):
     def ollama_models(self) -> set[str]:
         """Models to route to Ollama rather than to Azure."""
         return set(_split(self.models_ollama))
+
+    def ollama_request_headers(self) -> dict[str, str]:
+        """Every header the gate in front of Ollama expects.
+
+        The shared-secret pair is applied last, so a deployment configuring both cannot
+        end up sending an empty value for the header it actually relies on.
+        """
+        headers = dict(self.ollama_headers)
+        if self.ollama_auth_header and self.ollama_auth_token:
+            headers[self.ollama_auth_header] = self.ollama_auth_token
+        return headers
 
     @model_validator(mode="after")
     def _ollama_routing_is_coherent(self) -> Settings:

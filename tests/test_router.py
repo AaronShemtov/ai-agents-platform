@@ -130,6 +130,70 @@ def test_a_model_cannot_be_both_local_and_responses_only() -> None:
         )
 
 
+# -- the gate in front of Ollama ---------------------------------------------
+
+
+def test_the_shared_secret_becomes_a_header() -> None:
+    settings = Settings(**AZURE, ollama_base_url="https://x/v1", ollama_auth_token="s3cret")
+    assert settings.ollama_request_headers() == {"X-Agent-Key": "s3cret"}
+
+
+def test_no_token_means_no_header() -> None:
+    """An empty value must not be sent — the gate would refuse it and the cause would
+    read as a network problem rather than a missing secret."""
+    settings = Settings(**AZURE, ollama_base_url="https://x/v1")
+    assert settings.ollama_request_headers() == {}
+
+
+def test_the_header_name_is_configurable() -> None:
+    settings = Settings(
+        **AZURE,
+        ollama_base_url="https://x/v1",
+        ollama_auth_header="X-Other",
+        ollama_auth_token="s3cret",
+    )
+    assert settings.ollama_request_headers() == {"X-Other": "s3cret"}
+
+
+def test_the_pair_and_the_dict_are_merged() -> None:
+    """A Cloudflare Access token needs two headers; a shared secret needs one."""
+    settings = Settings(
+        **AZURE,
+        ollama_base_url="https://x/v1",
+        ollama_headers={"CF-Access-Client-Id": "abc.access"},
+        ollama_auth_token="s3cret",
+    )
+    assert settings.ollama_request_headers() == {
+        "CF-Access-Client-Id": "abc.access",
+        "X-Agent-Key": "s3cret",
+    }
+
+
+def test_a_real_token_wins_over_a_blank_one_in_the_dict() -> None:
+    settings = Settings(
+        **AZURE,
+        ollama_base_url="https://x/v1",
+        ollama_headers={"X-Agent-Key": ""},
+        ollama_auth_token="s3cret",
+    )
+    assert settings.ollama_request_headers()["X-Agent-Key"] == "s3cret"
+
+
+def test_the_client_is_built_with_those_headers() -> None:
+    llm = build_llm(
+        Settings(
+            **AZURE,
+            ollama_base_url="https://x/v1",
+            models_ollama="qwen3.5:0.8b",
+            ollama_auth_token="s3cret",
+        )
+    )
+    assert isinstance(llm, ModelRouter)
+    local = llm.backend_for("qwen3.5:0.8b").client
+    sent = local._client._custom_headers or {}  # type: ignore[attr-defined]
+    assert sent.get("X-Agent-Key") == "s3cret"
+
+
 def test_headers_are_json_because_a_secret_may_contain_a_comma() -> None:
     """The gate in front of Ollama needs credentials; JSON keeps them intact."""
     settings = Settings(

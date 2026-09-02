@@ -23,6 +23,17 @@ from agentcore.llm.base import LLMClient, LLMResponse
 
 logger = logging.getLogger(__name__)
 
+# Sent to the self-hosted backend instead of the OpenAI SDK's own User-Agent.
+#
+# Two reasons, and the first is simply that it is true: this is not the OpenAI Python
+# library talking, it is our agent, and the origin's logs should say so. The second is
+# that it is load-bearing. Cloudflare blocks known AI-client User-Agents, and it does
+# that to traffic reaching your own origin through your own zone: measured against
+# llm-host.1ms.my, an otherwise identical POST is 200 with httpx's default agent and 403
+# with "OpenAI/Python 3.0.0", which the SDK surfaces as an opaque
+# "PermissionDeniedError: Your request was blocked."
+USER_AGENT = "agentcore (ai-agents-platform)"
+
 
 @dataclass(frozen=True)
 class Backend:
@@ -82,7 +93,7 @@ def build_llm(settings: Settings) -> LLMClient:
             # listed in both MODELS_OLLAMA and MODELS_RESPONSES_API, so this cannot
             # silently disagree with configuration.
             responses_models=set(),
-            headers=settings.ollama_request_headers(),
+            headers={"User-Agent": USER_AGENT, **settings.ollama_request_headers()},
             # Empty string means "send nothing and take the model's default", which is
             # how a deployment opts back into thinking.
             extra_params=(

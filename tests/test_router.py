@@ -10,7 +10,7 @@ from pydantic import ValidationError
 from agentcore.config import Settings
 from agentcore.llm.azure import AzureFoundryClient
 from agentcore.llm.base import LLMResponse
-from agentcore.llm.router import Backend, ModelRouter, build_llm
+from agentcore.llm.router import USER_AGENT, Backend, ModelRouter, build_llm
 
 AZURE = {
     "azure_openai_base_url": "https://res.services.ai.azure.com/openai/v1/",
@@ -177,6 +177,35 @@ def test_a_real_token_wins_over_a_blank_one_in_the_dict() -> None:
         ollama_auth_token="s3cret",
     )
     assert settings.ollama_request_headers()["X-Agent-Key"] == "s3cret"
+
+
+def test_the_local_backend_identifies_itself() -> None:
+    """Not as the OpenAI SDK — Cloudflare blocks that User-Agent outright, and it is
+    not what is talking anyway."""
+    llm = build_llm(
+        Settings(**AZURE, ollama_base_url="https://x/v1", models_ollama="qwen3.5:0.8b")
+    )
+    assert isinstance(llm, ModelRouter)
+    local = llm.backend_for("qwen3.5:0.8b").client
+    sent = local._client._custom_headers or {}  # type: ignore[attr-defined]
+    assert sent.get("User-Agent") == USER_AGENT
+    assert "OpenAI" not in sent.get("User-Agent", "")
+
+
+def test_the_secret_survives_the_user_agent() -> None:
+    """Both are set in one dict literal; an ordering slip would drop the secret."""
+    llm = build_llm(
+        Settings(
+            **AZURE,
+            ollama_base_url="https://x/v1",
+            models_ollama="qwen3.5:0.8b",
+            ollama_auth_token="s3cret",
+        )
+    )
+    assert isinstance(llm, ModelRouter)
+    sent = llm.backend_for("qwen3.5:0.8b").client._client._custom_headers  # type: ignore[attr-defined]
+    assert sent.get("X-Agent-Key") == "s3cret"
+    assert sent.get("User-Agent") == USER_AGENT
 
 
 def test_the_client_is_built_with_those_headers() -> None:

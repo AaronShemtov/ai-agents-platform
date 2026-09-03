@@ -102,6 +102,14 @@ def build_llm(settings: Settings) -> LLMClient:
                 else {}
             ),
             timeout=settings.ollama_timeout_seconds,
+            # One retry, not the three the hosted path uses. A cold prefill of a large
+            # prompt takes longer than Cloudflare will wait for an origin — 160s
+            # measured against 100s allowed — so the first call after the model is
+            # unloaded comes back 524. Retrying that three times turns one slow request
+            # into four, and the user watches "Думаю…" for the better part of seven
+            # minutes with nothing to read at the end. One retry still forgives a
+            # genuine blip; beyond that, failing with the error is kinder.
+            max_retries=1,
             label="OLLAMA",
         ),
         models=frozenset(local),

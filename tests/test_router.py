@@ -208,6 +208,20 @@ def test_the_secret_survives_the_user_agent() -> None:
     assert sent.get("User-Agent") == USER_AGENT
 
 
+def test_the_local_backend_does_not_retry_three_times() -> None:
+    """A cold prefill outlasts Cloudflare's 100s origin timeout, so the first call after
+    the model unloads is a 524. Three retries make that four slow failures and several
+    minutes of silence."""
+    llm = build_llm(
+        Settings(**AZURE, ollama_base_url="https://x/v1", models_ollama="qwen3.5:0.8b")
+    )
+    assert isinstance(llm, ModelRouter)
+    local = llm.backend_for("qwen3.5:0.8b").client
+    assert local._client.max_retries == 1  # type: ignore[attr-defined]
+    # The hosted path keeps its own retries; this is not a global change.
+    assert llm.backend_for("gpt-5.6-sol").client._client.max_retries == 3  # type: ignore[attr-defined]
+
+
 def test_the_client_is_built_with_those_headers() -> None:
     llm = build_llm(
         Settings(

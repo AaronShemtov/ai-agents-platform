@@ -19,6 +19,10 @@ dependencies = [
     "httpx2>=2.5",
     # Only used by the mcp_cluster entrypoint, but all entrypoints ship in one image.
     "kubernetes>=31.0",
+    # Exposition format and the default process collectors. Hand-rolling the format is
+    # easy to get subtly wrong — histogram bucket accumulation especially — and this is
+    # the library every Prometheus scraper is tested against.
+    "prometheus-client>=0.21",
 ]
 
 [project.optional-dependencies]

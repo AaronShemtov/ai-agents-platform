@@ -15,8 +15,10 @@ from collections.abc import Callable
 import uvicorn
 from starlette.applications import Starlette
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 from starlette.routing import Route
+
+from agentcore import metrics
 
 ReadinessFn = Callable[[], tuple[bool, str]]
 
@@ -34,10 +36,17 @@ def build_health_app(*, agent: str, readiness: ReadinessFn) -> Starlette:
             return JSONResponse({"status": "not-ready", "detail": detail}, status_code=503)
         return JSONResponse({"status": "ready", "detail": detail})
 
+    async def metrics_endpoint(_: Request) -> Response:
+        payload, content_type = metrics.render()
+        return Response(payload, media_type=content_type)
+
     return Starlette(
         routes=[
             Route("/healthz", healthz),
             Route("/readyz", readyz),
+            # Scraped by Prometheus via the ServiceMonitor in personal-k8s. Same port as
+            # the probes: it is a ClusterIP Service, never exposed outside the cluster.
+            Route("/metrics", metrics_endpoint),
             Route("/", healthz),
         ]
     )

@@ -271,6 +271,12 @@ class AgentLoop:
         if qualified is None:
             # The model invented a tool, or called one filtered out by the profile.
             audit.denied(tool=call.name, reason="unknown tool")
+            # Also recorded as a tool_call so that every attempt appears exactly once in
+            # both the audit log and the metrics. Without it, invented names — the ones
+            # most worth counting — would be the only attempts missing from the counter.
+            audit.tool_call(
+                tool=call.name, arguments=call.arguments, decision="unknown_tool", ok=False
+            )
             return (
                 f"error: инструмента {call.name} не существует. Доступные: {catalog.names()}",
                 False,

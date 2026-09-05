@@ -19,6 +19,8 @@ from typing import Any
 
 import structlog
 
+from agentcore import metrics
+
 _AUDIT = "audit"
 
 
@@ -56,6 +58,7 @@ def _digest(arguments: dict[str, Any]) -> str:
 
 class AuditLog:
     def __init__(self, *, agent: str, chat_id: int | str) -> None:
+        self._agent = agent
         self._log = structlog.get_logger(_AUDIT).bind(agent=agent, chat_id=str(chat_id))
 
     def tool_call(
@@ -77,6 +80,9 @@ class AuditLog:
             ok=ok,
             duration_ms=duration_ms,
             error=error,
+        )
+        metrics.record_tool_call(
+            agent=self._agent, tool=tool, decision=decision, ok=ok, duration_ms=duration_ms
         )
 
     def turn(
@@ -105,6 +111,18 @@ class AuditLog:
             total_tokens=prompt_tokens + completion_tokens,
             duration_ms=duration_ms,
             stopped_because=stopped_because,
+        )
+        metrics.record_turn(
+            agent=self._agent,
+            model=model,
+            steps=steps,
+            duration_ms=duration_ms,
+            stopped_because=stopped_because,
+            prompt_tokens=prompt_tokens,
+            completion_tokens=completion_tokens,
+            cached_tokens=cached_tokens,
+            reasoning_tokens=reasoning_tokens,
+            billable_tokens=billable_tokens,
         )
 
     def denied(self, *, tool: str, reason: str) -> None:

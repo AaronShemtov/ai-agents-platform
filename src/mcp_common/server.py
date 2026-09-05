@@ -22,7 +22,7 @@ from collections.abc import Awaitable, Callable
 import uvicorn
 from mcp.server import MCPServer
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import JSONResponse, Response
 
 logger = logging.getLogger(__name__)
 
@@ -61,6 +61,17 @@ def build_server(
         if not ok:
             return JSONResponse({"status": "not-ready", "detail": detail}, status_code=503)
         return JSONResponse({"status": "ready", "detail": detail})
+
+    @server.custom_route("/metrics", methods=["GET"], include_in_schema=False)
+    async def _metrics(_: Request) -> Response:
+        # Every server built here gets the endpoint, not just the agent ones. For an
+        # MCP server the agent counters stay at zero, but the process collectors that
+        # prometheus_client registers by default — resident memory, CPU, open file
+        # descriptors — are worth having on all four.
+        from agentcore import metrics
+
+        payload, content_type = metrics.render()
+        return Response(payload, media_type=content_type)
 
     return server
 

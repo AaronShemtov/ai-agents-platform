@@ -80,12 +80,16 @@ class AzureFoundryClient:
         timeout: float = 180.0,
         max_retries: int = 3,
         label: str = "AZURE_OPENAI",
+        # The GenAI conventions want the provider on every metric. It is a property
+        # of the endpoint, not of the model, so it is set where the endpoint is.
+        provider: str = "azure.ai.openai",
     ) -> None:
         if not base_url:
             raise LLMError(f"{label}_BASE_URL is not set")
         if not api_key:
             raise LLMError(f"{label}_API_KEY is not set")
         self._responses_models = responses_models or set()
+        self._provider = provider
         # Merged into every request. The one thing this is actually for: a reasoning
         # model served by Ollama needs reasoning_effort="none", and that is a property
         # of the backend rather than of any single call.
@@ -97,6 +101,10 @@ class AzureFoundryClient:
             timeout=timeout,
             max_retries=max_retries,
         )
+
+    def provider_for(self, _model: str) -> str:
+        """Every model on this endpoint comes from the same provider."""
+        return self._provider
 
     def uses_responses(self, model: str) -> bool:
         return model in self._responses_models

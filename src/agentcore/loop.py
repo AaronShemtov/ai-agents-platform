@@ -24,6 +24,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from agentcore import metrics
 from agentcore.audit import AuditLog, Timer
 from agentcore.config import Settings
 from agentcore.llm.azure import RAW_OUTPUT_KEY
@@ -106,6 +107,16 @@ class AgentLoop:
         """
         return self._settings.max_billable_tokens_per_turn
 
+    def _provider_for(self, model: str) -> str:
+        """Provider label for the GenAI metrics.
+
+        Optional on the LLMClient protocol: a client predating it, or a test double,
+        simply does not answer, and the metric says "unknown" rather than a turn failing
+        over a label.
+        """
+        resolve = getattr(self._llm, "provider_for", None)
+        return resolve(model) if callable(resolve) else "unknown"
+
     async def catalog(self, *, force_refresh: bool = False) -> ToolCatalog:
         tools = await self._pool.list_tools(force_refresh=force_refresh)
         return build_catalog(tools, is_allowed=self._profile.tool_allowed)
@@ -153,16 +164,35 @@ class AgentLoop:
             steps += 1
             messages = chat.transcript(self._profile.system_prompt, max_tokens=self.max_tokens)
 
+            # Timed apart from the turn on purpose: a slow turn is either a slow model
+            # or slow tools, and only these two clocks tell the two apart.
+            call_started = time.monotonic()
+            provider = self._provider_for(model)
             try:
                 response = await self._llm.complete(
                     model=model, messages=messages, tools=catalog.specs or None
                 )
             except LLMError as exc:
                 logger.exception("llm call failed")
+                metrics.record_llm_call(
+                    provider=provider, model=model,
+                    duration_seconds=time.monotonic() - call_started,
+                    prompt_tokens=0, completion_tokens=0,
+                    cached_tokens=0, reasoning_tokens=0,
+                    error_type=type(exc).__name__,
+                )
                 stopped = "llm_error"
                 answer = f"Ошибка модели: {exc}"
                 break
 
+            metrics.record_llm_call(
+                provider=provider, model=model,
+                duration_seconds=time.monotonic() - call_started,
+                prompt_tokens=response.usage.prompt_tokens,
+                completion_tokens=response.usage.completion_tokens,
+                cached_tokens=response.usage.cached_tokens,
+                reasoning_tokens=response.usage.reasoning_tokens,
+            )
             usage = usage + response.usage
 
             chat.append(
@@ -245,6 +275,7 @@ class AgentLoop:
             billable_tokens=usage.billable,
             duration_ms=duration_ms,
             stopped_because=stopped,
+            tool_calls=tool_calls,
         )
         return LoopResult(
             text=answer,
@@ -298,7 +329,17 @@ class AgentLoop:
 
         if verdict.decision is Decision.REQUIRE_APPROVAL:
             await progress(f"⏸ Жду подтверждения: {qualified}")
+            # How long a person takes to answer is the one latency here that no amount of
+            # engineering shortens, and on an agent that asks before it changes anything
+            # it dominates every other number in the turn.
+            asked_at = time.monotonic()
             approved = await approver(qualified, call.arguments, verdict.reason)
+            metrics.record_approval(
+                agent=audit.agent,
+                tool=qualified,
+                outcome="approved" if approved else "rejected",
+                waited_seconds=time.monotonic() - asked_at,
+            )
             if not approved:
                 audit.tool_call(
                     tool=qualified, arguments=call.arguments, decision="rejected", ok=False

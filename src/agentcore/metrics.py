@@ -1,28 +1,45 @@
-"""Prometheus metrics for the agents.
+"""Metrics for the agents, following the OpenTelemetry GenAI semantic conventions.
 
-Emitted from `AuditLog`, right beside the log line describing the same event. That is
-the whole design: one call site per fact, so a counter and its log line cannot drift
-apart, and the loop needs no instrumentation of its own.
+Why these names and not ours
+----------------------------
+The GenAI conventions are what every LLM observability product consumes, so an agent
+that emits them can be pointed at one later without re-instrumenting. Names, units and
+bucket boundaries below are copied from the specification rather than chosen, because
+the buckets are the part that silently stops matching if you improvise.
 
-What goes where
----------------
-Metrics answer *how many, how fast, how much*; logs answer *what exactly*. The split is
-not stylistic — it is forced by how a time-series database stores data. Series count is
-the product of label value counts, and every series costs memory and index space for as
-long as it is retained. So a tool name is a fine label (there are 59) and a repository
-path, a chat id or the text of a question is not.
+Worth knowing what is being adopted, though: as of September 2026 every `gen_ai.*`
+attribute and metric still carries the "Development" stability badge, there is no 1.0,
+and in June 2026 the whole set moved out of the main semantic-conventions repository
+into `open-telemetry/semantic-conventions-genai`. So this is the direction the industry
+is pointing, not a settled contract. Expect churn, and prefer the spec's spelling over
+inventing our own when a concept exists in both.
+
+OTel names use dots; Prometheus does not allow them. The mapping applied here is the
+standard one — dots become underscores, and duration metrics take a `_seconds` suffix.
+
+What the standard does not cover
+--------------------------------
+Three things this platform does that the conventions have no place for, kept under our
+own `agent_` prefix so the two sets never look like one:
+
+  * what local policy decided — the guardrail is the point of an agent with write access
+  * how long a human took to approve, and whether they did
+  * cached and reasoning tokens, added as extra `gen_ai.token.type` values
 
 Nothing here records what anyone said. Arguments stay hashed in the audit log; this
 module never sees them.
 
-Cardinality budget
-------------------
-Worst case with two agents, 59 tools, 7 models: roughly 1200 series, and in practice a
-few hundred because only combinations that actually occur are created. Measured against
-a head block holding 31,617 series, so this is a percent or two.
+Cardinality
+-----------
+Series count is the product of label value counts, and every series is paid for until
+it falls out of retention. The expensive one is `gen_ai_execute_tool_duration_seconds`:
+the spec requires the tool name, and 59 tools times fourteen buckets times two agents is
+about 1650 series if every tool is used. In practice a handful are. Measured against a
+head block holding 31,617 series, that is affordable — but it is the line to watch if
+the catalog grows.
 
-The one genuinely unbounded input is the tool name, because a model can invent one. That
-is what `_tool_label` is for.
+The one genuinely unbounded input is the tool name, because a model can invent one.
+`_tool_label` bounds it.
 """
 
 from __future__ import annotations
@@ -33,58 +50,106 @@ from prometheus_client import CONTENT_TYPE_LATEST, Counter, Histogram, generate_
 MAX_TOOL_LABELS = 128
 _seen_tools: set[str] = set()
 
-TOOL_CALLS = Counter(
-    "agent_tool_calls_total",
-    "Tool calls attempted, by what local policy decided and whether the call succeeded.",
-    ["agent", "tool", "decision", "ok"],
+# Bucket boundaries are the specification's, verbatim. They look arbitrary because they
+# are shared: matching them is what lets a dashboard or a backend built for the
+# convention read these histograms without being told anything.
+_TOKEN_BUCKETS = (
+    1, 4, 16, 64, 256, 1024, 4096, 16384, 65536,
+    262144, 1048576, 4194304, 16777216, 67108864,
+)
+_DURATION_BUCKETS = (
+    0.01, 0.02, 0.04, 0.08, 0.16, 0.32, 0.64, 1.28,
+    2.56, 5.12, 10.24, 20.48, 40.96, 81.92,
+)
+_AGENT_DURATION_BUCKETS = (
+    0.1, 0.2, 0.4, 0.8, 1.6, 3.2, 6.4, 12.8, 25.6, 51.2, 102.4, 204.8, 409.6,
+)
+_CALL_COUNT_BUCKETS = (1, 2, 4, 8, 16, 32, 64, 128)
+
+# -- the convention ----------------------------------------------------------
+
+TOKEN_USAGE = Histogram(
+    "gen_ai_client_token_usage",
+    "Tokens used by a model call, by kind.",
+    ["gen_ai_operation_name", "gen_ai_provider_name", "gen_ai_request_model", "gen_ai_token_type"],
+    buckets=_TOKEN_BUCKETS,
 )
 
-TOOL_DURATION = Histogram(
-    "agent_tool_duration_seconds",
-    "Wall time of a tool call that was actually made.",
-    # Deliberately labelled by server rather than by tool: a per-tool histogram would be
-    # 59 tools times a dozen buckets, which is most of the cardinality budget spent on
-    # detail nobody reads. The server is what differs — a GitHub call is a second, a
-    # delegated coder run is minutes.
-    ["agent", "server"],
-    buckets=(0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 300, 900),
+OPERATION_DURATION = Histogram(
+    "gen_ai_client_operation_duration_seconds",
+    "Duration of a single model call.",
+    ["gen_ai_operation_name", "gen_ai_provider_name", "gen_ai_request_model", "error_type"],
+    buckets=_DURATION_BUCKETS,
+)
+
+AGENT_DURATION = Histogram(
+    "gen_ai_invoke_agent_duration_seconds",
+    "Duration of a whole agent turn, from the message to the answer.",
+    ["gen_ai_agent_name", "gen_ai_request_model", "error_type"],
+    buckets=_AGENT_DURATION_BUCKETS,
+)
+
+AGENT_INFERENCE_CALLS = Histogram(
+    "gen_ai_invoke_agent_inference_calls",
+    "Model calls made during one agent turn.",
+    ["gen_ai_agent_name", "gen_ai_request_model"],
+    buckets=_CALL_COUNT_BUCKETS,
+)
+
+AGENT_TOOL_CALLS = Histogram(
+    "gen_ai_invoke_agent_tool_calls",
+    "Tool calls made during one agent turn.",
+    ["gen_ai_agent_name", "gen_ai_request_model"],
+    buckets=_CALL_COUNT_BUCKETS,
+)
+
+EXECUTE_TOOL_DURATION = Histogram(
+    "gen_ai_execute_tool_duration_seconds",
+    "Duration of one tool call that was actually made.",
+    ["gen_ai_agent_name", "gen_ai_tool_name", "error_type"],
+    buckets=_DURATION_BUCKETS,
+)
+
+# -- our own, for what the convention has no place for ------------------------
+
+POLICY_DECISIONS = Counter(
+    "agent_policy_decisions_total",
+    "Tool calls by what local policy decided. The whole reason an agent with write "
+    "access is safe to run, so it is counted separately rather than folded into an "
+    "error rate: a refusal is a correct outcome, not a failure.",
+    ["agent", "tool", "decision"],
+)
+
+APPROVALS = Counter(
+    "agent_approvals_total",
+    "Confirmations asked of a human, by what they answered.",
+    ["agent", "tool", "outcome"],
+)
+
+APPROVAL_WAIT = Histogram(
+    "agent_approval_wait_seconds",
+    "How long the agent waited for a human to answer a confirmation.",
+    ["agent", "tool"],
+    # Human timescales, not machine ones: a person glances at a phone in seconds or
+    # gets to it in minutes, and the tail matters more than the middle.
+    buckets=(1, 5, 15, 30, 60, 120, 300, 600, 1800, 3600),
 )
 
 TURNS = Counter(
     "agent_turns_total",
-    "Completed turns, by why the loop stopped.",
+    "Completed turns by why the loop stopped. Complements the convention's duration "
+    "histogram, which has no place to say whether a turn ran out of steps or budget.",
     ["agent", "model", "stopped_because"],
-)
-
-TURN_DURATION = Histogram(
-    "agent_turn_duration_seconds",
-    "Wall time from the user's message to the answer.",
-    ["agent", "model"],
-    buckets=(1, 2.5, 5, 10, 20, 30, 60, 120, 300, 600),
-)
-
-TURN_STEPS = Histogram(
-    "agent_turn_steps",
-    "How many model calls a turn took.",
-    ["agent", "model"],
-    buckets=(1, 2, 3, 5, 8, 13, 21, 30, 40),
-)
-
-TOKENS = Counter(
-    "agent_tokens_total",
-    "Tokens by kind. `billable` is prompt minus cached plus completion — the one that "
-    "corresponds to spend, since a cached prompt token costs about a tenth of a fresh one.",
-    ["agent", "model", "kind"],
 )
 
 
 def _tool_label(name: str) -> str:
     """Bound the tool label, because the name can come from the model.
 
-    A hallucinated tool name reaches this module the same way a real one does. Without a
-    cap, every invention would mint a permanent time series, which is precisely the way
-    a Prometheus deployment is destroyed. Once the cap is reached, further unseen names
-    collapse into "other" — the count stays correct, only the breakdown stops growing.
+    A hallucinated tool name arrives here exactly like a real one. Uncapped, every
+    invention would mint a permanent time series — the standard way a Prometheus
+    deployment dies. Past the cap, unseen names collapse to "other": the totals stay
+    right, only the breakdown stops growing.
     """
     if name in _seen_tools:
         return name
@@ -99,6 +164,46 @@ def server_of(qualified: str) -> str:
     return qualified.split("__", 1)[0] if "__" in qualified else "unknown"
 
 
+def record_llm_call(
+    *,
+    provider: str,
+    model: str,
+    duration_seconds: float,
+    prompt_tokens: int,
+    completion_tokens: int,
+    cached_tokens: int,
+    reasoning_tokens: int,
+    error_type: str = "",
+) -> None:
+    """One model call. `error_type` is empty on success, per the convention."""
+    OPERATION_DURATION.labels(
+        gen_ai_operation_name="chat",
+        gen_ai_provider_name=provider,
+        gen_ai_request_model=model,
+        error_type=error_type,
+    ).observe(duration_seconds)
+
+    if error_type:
+        return
+
+    for token_type, value in (
+        # The two the specification defines.
+        ("input", prompt_tokens),
+        ("output", completion_tokens),
+        # Ours. `cached` is the one that decides what a turn costs — a cached prompt
+        # token is billed at roughly a tenth — and the convention has nowhere to put it.
+        ("cached", cached_tokens),
+        ("reasoning", reasoning_tokens),
+    ):
+        if value:
+            TOKEN_USAGE.labels(
+                gen_ai_operation_name="chat",
+                gen_ai_provider_name=provider,
+                gen_ai_request_model=model,
+                gen_ai_token_type=token_type,
+            ).observe(value)
+
+
 def record_tool_call(
     *,
     agent: str,
@@ -108,16 +213,21 @@ def record_tool_call(
     duration_ms: int | None,
 ) -> None:
     """One attempted tool call. `ok` is None when nothing was sent."""
-    TOOL_CALLS.labels(
-        agent=agent,
-        tool=_tool_label(tool),
-        decision=decision,
-        # A denied call has no outcome to report, and "false" would read as a failure of
-        # the tool rather than a refusal to call it.
-        ok={True: "true", False: "false", None: "n/a"}[ok],
-    ).inc()
-    if duration_ms is not None:
-        TOOL_DURATION.labels(agent=agent, server=server_of(tool)).observe(duration_ms / 1000)
+    POLICY_DECISIONS.labels(agent=agent, tool=_tool_label(tool), decision=decision).inc()
+    if duration_ms is None:
+        # Denied, rejected, or invented: there was no call to time.
+        return
+    EXECUTE_TOOL_DURATION.labels(
+        gen_ai_agent_name=agent,
+        gen_ai_tool_name=_tool_label(tool),
+        error_type="" if ok else "tool_error",
+    ).observe(duration_ms / 1000)
+
+
+def record_approval(*, agent: str, tool: str, outcome: str, waited_seconds: float) -> None:
+    """One confirmation put to a human. `outcome` is approved or rejected."""
+    APPROVALS.labels(agent=agent, tool=_tool_label(tool), outcome=outcome).inc()
+    APPROVAL_WAIT.labels(agent=agent, tool=_tool_label(tool)).observe(waited_seconds)
 
 
 def record_turn(
@@ -125,27 +235,25 @@ def record_turn(
     agent: str,
     model: str,
     steps: int,
+    tool_calls: int,
     duration_ms: int,
     stopped_because: str,
-    prompt_tokens: int,
-    completion_tokens: int,
-    cached_tokens: int,
-    reasoning_tokens: int,
-    billable_tokens: int,
 ) -> None:
-    """One completed turn, however it ended."""
+    """One completed turn, however it ended.
+
+    Tokens are not recorded here: they belong to the model calls that consumed them, and
+    counting them twice would make any sum wrong.
+    """
     TURNS.labels(agent=agent, model=model, stopped_because=stopped_because).inc()
-    TURN_DURATION.labels(agent=agent, model=model).observe(duration_ms / 1000)
-    TURN_STEPS.labels(agent=agent, model=model).observe(steps)
-    for kind, value in (
-        ("prompt", prompt_tokens),
-        ("completion", completion_tokens),
-        ("cached", cached_tokens),
-        ("reasoning", reasoning_tokens),
-        ("billable", billable_tokens),
-    ):
-        if value:
-            TOKENS.labels(agent=agent, model=model, kind=kind).inc(value)
+    AGENT_DURATION.labels(
+        gen_ai_agent_name=agent,
+        gen_ai_request_model=model,
+        # A turn that hit max_steps or the spend ceiling did not error — it was stopped
+        # on purpose. Only a model or transport failure is an error here.
+        error_type="llm_error" if stopped_because == "llm_error" else "",
+    ).observe(duration_ms / 1000)
+    AGENT_INFERENCE_CALLS.labels(gen_ai_agent_name=agent, gen_ai_request_model=model).observe(steps)
+    AGENT_TOOL_CALLS.labels(gen_ai_agent_name=agent, gen_ai_request_model=model).observe(tool_calls)
 
 
 def render() -> tuple[bytes, str]:

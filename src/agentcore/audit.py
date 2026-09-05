@@ -61,6 +61,11 @@ class AuditLog:
         self._agent = agent
         self._log = structlog.get_logger(_AUDIT).bind(agent=agent, chat_id=str(chat_id))
 
+    @property
+    def agent(self) -> str:
+        """Which agent this log belongs to, for callers recording their own metrics."""
+        return self._agent
+
     def tool_call(
         self,
         *,
@@ -97,6 +102,7 @@ class AuditLog:
         cached_tokens: int = 0,
         reasoning_tokens: int = 0,
         billable_tokens: int = 0,
+        tool_calls: int = 0,
     ) -> None:
         self._log.info(
             "turn",
@@ -112,17 +118,16 @@ class AuditLog:
             duration_ms=duration_ms,
             stopped_because=stopped_because,
         )
+        # Tokens are deliberately not passed on: they are recorded against the model
+        # calls that consumed them, and counting them again per turn would double any
+        # sum taken over the token histogram.
         metrics.record_turn(
             agent=self._agent,
             model=model,
             steps=steps,
+            tool_calls=tool_calls,
             duration_ms=duration_ms,
             stopped_because=stopped_because,
-            prompt_tokens=prompt_tokens,
-            completion_tokens=completion_tokens,
-            cached_tokens=cached_tokens,
-            reasoning_tokens=reasoning_tokens,
-            billable_tokens=billable_tokens,
         )
 
     def denied(self, *, tool: str, reason: str) -> None:

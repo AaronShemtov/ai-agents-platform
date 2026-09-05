@@ -56,6 +56,10 @@ class ModelRouter:
     def backend_for(self, model: str) -> Backend:
         return self._by_model.get(model, self._default)
 
+    def provider_for(self, model: str) -> str:
+        """Which provider serves this model, for the GenAI metric labels."""
+        return self.backend_for(model).client.provider_for(model)
+
     async def complete(
         self,
         *,
@@ -111,6 +115,7 @@ def build_llm(settings: Settings) -> LLMClient:
             # genuine blip; beyond that, failing with the error is kinder.
             max_retries=1,
             label="OLLAMA",
+            provider="ollama",
         ),
         models=frozenset(local),
     )

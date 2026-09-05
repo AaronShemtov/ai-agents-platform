@@ -84,7 +84,7 @@ billable), общей длительностью и числом/времене�
 Если всё-таки нужно локально:
 
 ```bash
-python -m venv && .venv/bin/pip install -e ".[dev]"
+python -m venv .venv && .venv/bin/pip install -e ".[dev]"
 cp .env.example .env   # заполнить
 .venv/bin/pytest -q
 AGENT_PROFILE=lead .venv/bin/python -m agentcore

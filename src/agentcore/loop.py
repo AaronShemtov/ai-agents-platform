@@ -33,7 +33,7 @@ from agentcore.mcp.toolset import ToolCatalog, build_catalog
 from agentcore.memory import ChatMemory
 from agentcore.policy import Decision, Policy
 from agentcore.profiles import AgentProfile
-from agentcore.ui.usage import append_usage_footer, format_usage_footer
+from agentcore.usage_display import append_usage_footer, format_usage_footer
 
 logger = logging.getLogger(__name__)
 

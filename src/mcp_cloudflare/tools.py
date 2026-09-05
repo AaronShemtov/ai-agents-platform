@@ -121,6 +121,32 @@ def _slim_waf_rule(rule: dict[str, Any]) -> dict[str, Any]:
 # -- registration ------------------------------------------------------------
 
 
+# Cloudflare caps a single purge-by-URL call at 30 addresses outside Enterprise.
+MAX_PURGE_URLS = 30
+
+
+def purge_body(urls: list[str] | None, everything: bool) -> dict[str, Any] | str:
+    """The request body for a purge, or an error string explaining why there is none.
+
+    Cloudflare accepts either form happily, so the guard here is against the caller
+    rather than the API: purging everything when a single URL was meant means every
+    page on the zone is fetched from the origin again, which on this cluster is a real
+    load spike rather than an abstraction.
+    """
+    if everything and urls:
+        return "выбери одно: либо everything=true, либо список urls"
+    if everything:
+        return {"purge_everything": True}
+    if not urls:
+        return "нечего чистить: передай urls или everything=true"
+    if len(urls) > MAX_PURGE_URLS:
+        return f"за один раз можно не больше {MAX_PURGE_URLS} адресов, прислано {len(urls)}"
+    bad = [u for u in urls if not u.startswith(("http://", "https://"))]
+    if bad:
+        return f"адреса должны быть полными URL со схемой, а не путями: {bad[:3]}"
+    return {"files": urls}
+
+
 def register(server: Any) -> None:
     """Attach the tools to an MCPServer. Long by nature: a flat list of definitions."""
     api = get_api
@@ -453,3 +479,35 @@ def register(server: Any) -> None:
         except CloudflareError as exc:
             return tool_error(exc.message)
         return {"ok": True, "tunnel_id": tunnel_id, "ingress": ingress}
+
+    # ---- cache ------------------------------------------------------------
+
+    @server.tool(
+        description=(
+            "Purge Cloudflare's cache for a zone. Pass urls to drop specific pages, or "
+            "everything=true to drop the whole zone. Prefer urls when you know what "
+            "changed: purging everything sends every subsequent request to the origin "
+            "at once. Urls must be full addresses including https://."
+        )
+    )
+    async def purge_cache(
+        zone: str,
+        urls: list[str] | None = None,
+        everything: bool = False,
+    ) -> dict[str, Any]:
+        body = purge_body(urls, everything)
+        if isinstance(body, str):
+            return tool_error(body)
+        try:
+            zone_id = await api().zone_id(zone)
+            await api().request("POST", f"/zones/{zone_id}/purge_cache", json=body)
+        except CloudflareError as exc:
+            return tool_error(
+                exc.message,
+                hint="права Cache Purge может не быть у токена — проверь его в Cloudflare",
+            )
+        return {
+            "ok": True,
+            "zone": zone,
+            "purged": "everything" if everything else urls,
+        }

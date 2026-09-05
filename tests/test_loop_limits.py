@@ -105,10 +105,15 @@ def test_cumulative_usage_does_not_stop_a_multistep_turn():
 
     result, audit = run(loop)
 
-    assert result.text == "done"
     assert result.steps == 2
     assert result.stopped_because == "completed"
     assert audit.stop_reason == "completed"
+    assert "done" in result.text
+    assert "📊 AI stats" in result.text
+    assert "model=test-model" in result.text
+    assert result.duration_ms >= 0
+    assert result.tool_calls == 1
+    assert result.tool_duration_ms >= 0
 
 
 def test_provider_length_finish_reason_is_reported_exactly():
@@ -199,4 +204,4 @@ def test_the_cached_prefix_does_not_count_against_the_spend_ceiling():
     result, _audit = run(loop)
 
     assert result.stopped_because == "completed"
-    assert result.text == "done"
+    assert "done" in result.text

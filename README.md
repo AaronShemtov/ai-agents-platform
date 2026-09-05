@@ -28,7 +28,7 @@ Telegram ──► agent-lead ──┬──► mcp-github       (готовы�
 |---|---|
 | `src/agentcore/` | Агент: loop, MCP-клиент, LLM-клиент, policy, память, Telegram |
 | `src/mcp_common/` | Общий скелет наших MCP-серверов (транспорт, health, ошибки) |
-| `src/mcp_cloudflare/` | MCP-сервер: DNS, WAF, Cloudflare Tunnel |
+| `src/mcp_cloudflare/` | MCP-сервер: DNS, WAF, туннели |
 | `src/mcp_cluster/` | MCP-сервер: read-only Kubernetes |
 | `agents/` | Профили агентов |
 | `tests/` | Юнит-тесты policy, каталога инструментов, туннелей, памяти |
@@ -46,7 +46,7 @@ Telegram ──► agent-lead ──┬──► mcp-github       (готовы�
 ### Команды бота
 
 `/new` — забыть контекст · `/model` — сменить модель · `/models` — список ·
-`/tools` — подключённые инструменты · `/status` — режимы и лимиты · `/cancel` — прервать
+`/tools` — подключённые инструменты · `/status` — режимы записи и лимиты · `/cancel` — прервать
 
 ## Права
 
@@ -64,6 +64,16 @@ Telegram ──► agent-lead ──┬──► mcp-github       (готовы�
 
 Переключатели режимов лежат в ConfigMap, закомментированными альтернативами:
 `GITHUB_WRITE_MODE`, `CLOUDFLARE_WRITE_MODE`.
+
+## AI stats
+
+После каждого agent turn `AgentLoop` добавляет в финальный ответ компактный footer
+`📊 AI stats` с моделью, шагами, stop reason, usage (input/output/cached/reasoning/
+billable), общей длительностью и числом/временем реально выполненных tool-вызовов.
+
+`cached` — это prompt cache провайдера (`cached_tokens`), а не KV-cache модели.
+Внутренний размер и состояние KV-cache, GPU memory и cache eviction провайдер API
+не сообщает, поэтому платформа не выводит и не оценивает эти значения.
 
 ## Разработка
 

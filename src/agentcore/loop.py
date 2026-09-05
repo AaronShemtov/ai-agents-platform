@@ -33,6 +33,7 @@ from agentcore.mcp.toolset import ToolCatalog, build_catalog
 from agentcore.memory import ChatMemory
 from agentcore.policy import Decision, Policy
 from agentcore.profiles import AgentProfile
+from agentcore.ui.usage import append_usage_footer, format_usage_footer
 
 logger = logging.getLogger(__name__)
 
@@ -50,6 +51,9 @@ class LoopResult:
     steps: int = 0
     usage: Usage = field(default_factory=Usage)
     stopped_because: str = "completed"
+    duration_ms: int = 0
+    tool_calls: int = 0
+    tool_duration_ms: int = 0
 
 
 async def _noop_progress(_: str) -> None:
@@ -125,6 +129,8 @@ class AgentLoop:
         steps = 0
         stopped = "completed"
         answer = ""
+        tool_calls = 0
+        tool_duration_ms = 0
 
         while steps < self.max_steps:
             if cancel is not None and cancel.is_set():
@@ -199,9 +205,12 @@ class AgentLoop:
                 await progress(response.content)
 
             for call in response.tool_calls:
-                result_text = await self._execute(
+                result_text, called, duration_ms = await self._execute(
                     call, catalog=catalog, audit=audit, progress=progress, approver=approver
                 )
+                if called:
+                    tool_calls += 1
+                    tool_duration_ms += duration_ms
                 chat.append(
                     {"role": "tool", "tool_call_id": call.id, "content": _clip(result_text)}
                 )
@@ -212,6 +221,20 @@ class AgentLoop:
                 "Скажи продолжать — продолжу из текущего контекста."
             )
 
+        duration_ms = int((time.monotonic() - started) * 1000)
+        answer = append_usage_footer(
+            answer,
+            format_usage_footer(
+                model=model,
+                steps=steps,
+                usage=usage,
+                duration_ms=duration_ms,
+                tool_calls=tool_calls,
+                tool_duration_ms=tool_duration_ms,
+                stopped_because=stopped,
+            ),
+        )
+
         audit.turn(
             model=model,
             steps=steps,
@@ -220,10 +243,18 @@ class AgentLoop:
             cached_tokens=usage.cached_tokens,
             reasoning_tokens=usage.reasoning_tokens,
             billable_tokens=usage.billable,
-            duration_ms=int((time.monotonic() - started) * 1000),
+            duration_ms=duration_ms,
             stopped_because=stopped,
         )
-        return LoopResult(text=answer, steps=steps, usage=usage, stopped_because=stopped)
+        return LoopResult(
+            text=answer,
+            steps=steps,
+            usage=usage,
+            stopped_because=stopped,
+            duration_ms=duration_ms,
+            tool_calls=tool_calls,
+            tool_duration_ms=tool_duration_ms,
+        )
 
     # -- one tool call -------------------------------------------------------
 
@@ -235,12 +266,16 @@ class AgentLoop:
         audit: AuditLog,
         progress: ProgressFn,
         approver: ApproverFn,
-    ) -> str:
+    ) -> tuple[str, bool, int]:
         qualified = catalog.resolve(call.name)
         if qualified is None:
             # The model invented a tool, or called one filtered out by the profile.
             audit.denied(tool=call.name, reason="unknown tool")
-            return f"error: инструмента {call.name} не существует. Доступные: {catalog.names()}"
+            return (
+                f"error: инструмента {call.name} не существует. Доступные: {catalog.names()}",
+                False,
+                0,
+            )
 
         verdict = self._policy.evaluate(qualified, call.arguments)
 
@@ -249,7 +284,11 @@ class AgentLoop:
             audit.tool_call(
                 tool=qualified, arguments=call.arguments, decision="deny", ok=False
             )
-            return f"denied by local policy, not by the remote service: {verdict.reason}"
+            return (
+                f"denied by local policy, not by the remote service: {verdict.reason}",
+                False,
+                0,
+            )
 
         if verdict.decision is Decision.REQUIRE_APPROVAL:
             await progress(f"⏸ Жду подтверждения: {qualified}")
@@ -262,7 +301,9 @@ class AgentLoop:
                     "denied by local policy, not by the remote service: пользователь "
                     "нажал «Отклонить». Запрос никуда не отправлялся, ничего не "
                     "изменилось. Это решение пользователя, а не сбой — не предлагай "
-                    "повторить тот же вызов с теми же аргументами."
+                    "повторить тот же вызов с теми же аргументами.",
+                    False,
+                    0,
                 )
 
         await progress(f"🔧 {qualified}")
@@ -278,7 +319,7 @@ class AgentLoop:
             duration_ms=timer.ms,
             error=None if result.ok else result.text[:200],
         )
-        return result.for_model()
+        return result.for_model(), True, timer.ms
 
 
 def _serialise_call(call: ToolCall) -> dict[str, Any]:

@@ -65,6 +65,14 @@ Telegram ──► agent-lead ──┬──► mcp-github       (готовы�
 Переключатели режимов лежат в ConfigMap, закомментированными альтернативами:
 `GITHUB_WRITE_MODE`, `CLOUDFLARE_WRITE_MODE`.
 
+## AI stats
+
+После каждого agent turn `AgentLoop` добавляет в финальный ответ компактный footer
+`📊 AI stats` с моделью, шагами, stop reason, usage (input/output/cached/reasoning/
+billable), общей длительностью и числом/временем реально выполненных tool-вызовов.
+
+`cached` — это prompt cache провайдера (`cached_tokens`), а не KV-cache модели.
+
 ## Разработка
 
 Ничего не собирается локально — всё проверяется в CI (`ruff`, импорт всех точек

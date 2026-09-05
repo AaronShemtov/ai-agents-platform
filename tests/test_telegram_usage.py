@@ -1,5 +1,5 @@
 from agentcore.llm.base import Usage
-from agentcore.ui.usage import append_usage_footer, format_usage_footer
+from agentcore.usage_display import append_usage_footer, format_usage_footer
 
 
 def test_footer_reports_provider_and_agent_metrics() -> None:

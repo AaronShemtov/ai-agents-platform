@@ -90,13 +90,6 @@ async def amain() -> int:
     )
     await pool.start()
 
-    agent_loop = AgentLoop(
-        profile=profile,
-        settings=settings,
-        llm=llm,
-        pool=pool,
-        policy=Policy(settings),
-    )
     # Durable memory, if it is configured. Constructed rather than connected:
     # there is no I/O here, so an unreachable database shows up as a warning on
     # the first turn instead of a pod that will not start. An agent that forgets
@@ -114,6 +107,17 @@ async def amain() -> int:
         logger.warning(
             "durable memory is not configured; history will be lost on restart"
         )
+
+    agent_loop = AgentLoop(
+        profile=profile,
+        settings=settings,
+        llm=llm,
+        pool=pool,
+        policy=Policy(settings),
+        # Built above, because the loop decides whether to offer the memory tools
+        # by whether this is None.
+        store=store,
+    )
 
     ui = TelegramUI(
         settings=settings,

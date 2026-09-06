@@ -152,20 +152,33 @@ class TelegramUI:
         All of them, unsearched — a few dozen cost about a thousand tokens, and
         an agent that knows things only when a search happens to surface them is
         harder to work with than one that knows nothing.
+
+        The instruction to keep new facts is returned even when there are none
+        yet. Gating it on a non-empty list is how the table would have stayed
+        empty for good: the model was told it could remember things only inside
+        the block that appears once it already has.
         """
         if self._store is None:
             return ""
+
+        keeping = (
+            "Если узнаёшь устойчивый факт о нём или его проектах — такой, который "
+            "пригодится и в следующих разговорах, — сохрани его сам, вызовом "
+            "memory__remember, не спрашивая разрешения и не откладывая на потом. "
+            "Узнал точнее — вызови ещё раз с тем же ключом, это заменит старое. "
+            "Разовые детали текущей задачи запоминать не надо: они и так в истории "
+            "этого разговора."
+        )
+
         facts = await self._store.facts()
         if not facts:
-            return ""
+            return keeping
+
         lines = "\n".join(f"- {f.fact}" for f in facts)
         return (
             "Что ты знаешь о человеке, с которым говоришь (накоплено в прошлых "
             "разговорах, считай это достоверным):\n"
-            f"{lines}\n\n"
-            "Если узнаёшь новый устойчивый факт о нём или его проектах — такой, "
-            "который пригодится и в следующих разговорах, — скажи об этом в ответе. "
-            "Разовые детали текущей задачи запоминать не надо."
+            f"{lines}\n\n" + keeping
         )
 
     # -- authorisation -------------------------------------------------------
@@ -244,7 +257,8 @@ class TelegramUI:
         facts = await self._store.facts()
         if not facts:
             await update.effective_message.reply_text(
-                "Пока ничего о тебе не записано."
+                "Пока ничего о тебе не записано. Диктовать ничего не надо — "
+                "я сам сохраняю то, что пригодится в следующих разговорах."
             )
             return
         lines = [

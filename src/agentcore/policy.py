@@ -21,6 +21,7 @@ from enum import StrEnum
 from typing import Any
 
 from agentcore.config import Settings, WriteMode
+from agentcore.localtools import MEMORY_SERVER
 from agentcore.mcp.client import split_qualified
 
 # Verbs that only read. Anything not matching these is treated as mutating — unknown
@@ -107,6 +108,15 @@ class Policy:
                 "кластер только на чтение: он управляется через GitOps. "
                 "Чтобы изменить кластер, отредактируй манифесты в personal-k8s и открой PR.",
             )
+
+        if server == MEMORY_SERVER:
+            # The agent's own two tables, under a database user with no grants
+            # on anything else — `select from admin.urls` as it is ORA-00942.
+            # There is nothing here worth gating: the worst case is a wrong
+            # fact about the person, which they can see with /memories and drop
+            # with /forget. Requiring a button would mean approving every act of
+            # remembering, which is the opposite of what memory is for.
+            return Verdict(Decision.ALLOW)
 
         # Unknown namespace: gate rather than guess.
         return Verdict(

@@ -29,11 +29,13 @@ from agentcore.audit import AuditLog, Timer
 from agentcore.config import Settings
 from agentcore.llm.azure import RAW_OUTPUT_KEY
 from agentcore.llm.base import LLMClient, LLMError, ToolCall, Usage
+from agentcore.localtools import call_local, is_local, memory_tools
 from agentcore.mcp.client import MCPPool
 from agentcore.mcp.toolset import ToolCatalog, build_catalog
 from agentcore.memory import ChatMemory
 from agentcore.policy import Decision, Policy
 from agentcore.profiles import AgentProfile
+from agentcore.store import AdbStore
 from agentcore.usage_display import append_usage_footer, format_usage_footer
 
 logger = logging.getLogger(__name__)
@@ -85,12 +87,15 @@ class AgentLoop:
         llm: LLMClient,
         pool: MCPPool,
         policy: Policy,
+        store: AdbStore | None = None,
     ) -> None:
         self._profile = profile
         self._settings = settings
         self._llm = llm
         self._pool = pool
         self._policy = policy
+        # Optional: without it the memory tools are not offered at all.
+        self._store = store
 
     @property
     def max_steps(self) -> int:
@@ -128,8 +133,12 @@ class AgentLoop:
         return resolve(model) if callable(resolve) else "unknown"
 
     async def catalog(self, *, force_refresh: bool = False) -> ToolCatalog:
+        # In-process tools join the remote ones before filtering, so a profile
+        # denies `memory__*` exactly the way it denies anything else.
         tools = await self._pool.list_tools(force_refresh=force_refresh)
-        return build_catalog(tools, is_allowed=self._profile.tool_allowed)
+        return build_catalog(
+            tools + memory_tools(self._store), is_allowed=self._profile.tool_allowed
+        )
 
     async def run(
         self,
@@ -254,7 +263,12 @@ class AgentLoop:
 
             for call in response.tool_calls:
                 result_text, called, duration_ms = await self._execute(
-                    call, catalog=catalog, audit=audit, progress=progress, approver=approver
+                    call,
+                    catalog=catalog,
+                    audit=audit,
+                    progress=progress,
+                    approver=approver,
+                    chat_id=chat.chat_id,
                 )
                 if called:
                     tool_calls += 1
@@ -315,6 +329,7 @@ class AgentLoop:
         audit: AuditLog,
         progress: ProgressFn,
         approver: ApproverFn,
+        chat_id: int | None = None,
     ) -> tuple[str, bool, int]:
         qualified = catalog.resolve(call.name)
         if qualified is None:
@@ -395,7 +410,12 @@ class AgentLoop:
         await progress(f"🔧 {qualified}")
 
         with Timer() as timer:
-            result = await self._pool.call_tool(qualified, call.arguments)
+            if is_local(qualified):
+                result = await call_local(
+                    qualified, call.arguments, store=self._store, chat_id=chat_id
+                )
+            else:
+                result = await self._pool.call_tool(qualified, call.arguments)
 
         audit.tool_call(
             tool=qualified,

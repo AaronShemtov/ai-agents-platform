@@ -39,8 +39,9 @@ from telegram.ext import (
 from agentcore.audit import AuditLog
 from agentcore.config import Settings
 from agentcore.loop import AgentLoop
-from agentcore.memory import MemoryStore
+from agentcore.memory import ChatMemory, MemoryStore
 from agentcore.profiles import AgentProfile
+from agentcore.store import AdbStore
 
 logger = logging.getLogger(__name__)
 
@@ -95,13 +96,77 @@ class TelegramUI:
         profile: AgentProfile,
         agent_loop: AgentLoop,
         memory: MemoryStore,
+        store: AdbStore | None = None,
     ) -> None:
         self._s = settings
         self._profile = profile
         self._loop = agent_loop
         self._memory = memory
+        # None means memory lives only in this process, as it did before there
+        # was anywhere durable to put it.
+        self._store = store
         self._pending: dict[str, asyncio.Future[bool]] = {}
         self._running: dict[int, asyncio.Event] = {}
+
+    # -- durable memory ------------------------------------------------------
+
+    async def _hydrate(self, chat: ChatMemory) -> None:
+        """Load a chat's history from the database, once per process.
+
+        `hydrated` is set before the read, not after, so a database that is down
+        costs one attempt rather than one per message. Losing history is bad;
+        adding ten seconds to every reply because of it is worse.
+        """
+        if chat.hydrated or self._store is None:
+            return
+        chat.hydrated = True
+        history = await self._store.history(
+            agent=self._profile.id,
+            chat_id=chat.chat_id,
+            limit=self._s.memory_history_messages,
+        )
+        if history:
+            chat.adopt(history)
+            logger.info(
+                "restored %d messages for chat %s", len(history), chat.chat_id
+            )
+
+    async def _persist(self, chat: ChatMemory) -> None:
+        """Write whatever this turn added.
+
+        Only the new messages: the transcript is rewritten in memory on every
+        step (trimming, tool results), and re-storing all of it would duplicate
+        the conversation a little more each turn.
+        """
+        if self._store is None:
+            return
+        for message in chat.unpersisted():
+            await self._store.append(
+                agent=self._profile.id, chat_id=chat.chat_id, message=message
+            )
+        chat.mark_persisted()
+
+    async def _facts_prompt(self) -> str:
+        """The facts, as a block appended to the system prompt.
+
+        All of them, unsearched — a few dozen cost about a thousand tokens, and
+        an agent that knows things only when a search happens to surface them is
+        harder to work with than one that knows nothing.
+        """
+        if self._store is None:
+            return ""
+        facts = await self._store.facts()
+        if not facts:
+            return ""
+        lines = "\n".join(f"- {f.fact}" for f in facts)
+        return (
+            "Что ты знаешь о человеке, с которым говоришь (накоплено в прошлых "
+            "разговорах, считай это достоверным):\n"
+            f"{lines}\n\n"
+            "Если узнаёшь новый устойчивый факт о нём или его проектах — такой, "
+            "который пригодится и в следующих разговорах, — скажи об этом в ответе. "
+            "Разовые детали текущей задачи запоминать не надо."
+        )
 
     # -- authorisation -------------------------------------------------------
 
@@ -138,6 +203,8 @@ class TelegramUI:
         await update.effective_message.reply_text(
             "<b>Команды</b>\n"
             "/new — забыть контекст разговора\n"
+            "/memories — что я помню о тебе\n"
+            "/forget &lt;ключ&gt; — удалить один факт о тебе\n"
             "/model &lt;имя&gt; — сменить модель для этого чата\n"
             "/models — какие модели доступны\n"
             "/tools — какие инструменты подключены\n"
@@ -149,8 +216,76 @@ class TelegramUI:
     async def cmd_new(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorised(update):
             return await self._refuse(update)
-        self._memory.reset(update.effective_chat.id)
-        await update.effective_message.reply_text("Контекст очищен.")
+        chat_id = update.effective_chat.id
+        self._memory.reset(chat_id)
+        if self._store is not None:
+            # Otherwise the next message would restore everything /new was
+            # meant to get rid of.
+            await self._store.clear(agent=self._profile.id, chat_id=chat_id)
+        await update.effective_message.reply_text(
+            "Контекст очищен — и в памяти, и в базе. Факты о тебе не тронуты, "
+            "их показывает /memories."
+        )
+
+    async def cmd_memories(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """What the agent believes about the user, and how to remove any of it.
+
+        The point of putting memory in a database was that it can be read back
+        and actually deleted. Without this command that is a claim nobody can
+        check.
+        """
+        if not self._authorised(update):
+            return await self._refuse(update)
+        if self._store is None:
+            await update.effective_message.reply_text(
+                "Долговременная память не подключена — я помню только текущий разговор."
+            )
+            return
+        facts = await self._store.facts()
+        if not facts:
+            await update.effective_message.reply_text(
+                "Пока ничего о тебе не записано."
+            )
+            return
+        lines = [
+            f"<code>{html.escape(f.key)}</code> — {html.escape(f.fact)}"
+            + (f" <i>({f.updated_at})</i>" if f.updated_at else "")
+            for f in facts
+        ]
+        # Not _send_long: that escapes its input, and these lines are already
+        # HTML on purpose — the key has to be copy-pasteable into /forget.
+        body = (
+            "Что я о тебе помню:\n\n"
+            + "\n\n".join(lines)
+            + "\n\nУдалить: <code>/forget ключ</code>"
+        )
+        for chunk in _split(body, MAX_MESSAGE):
+            await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
+
+    async def cmd_forget(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        if not self._authorised(update):
+            return await self._refuse(update)
+        if self._store is None:
+            await update.effective_message.reply_text("Долговременная память не подключена.")
+            return
+        key = " ".join(ctx.args).strip() if ctx.args else ""
+        if not key:
+            await update.effective_message.reply_text(
+                "Нужен ключ факта: /forget ключ. Список — /memories."
+            )
+            return
+        try:
+            removed = await self._store.forget(key)
+        # Broad on purpose: the user gets the reason, not a stack trace.
+        except Exception as exc:
+            logger.exception("forget failed")
+            await update.effective_message.reply_text(
+                f"Не смог удалить: {html.escape(type(exc).__name__)}"
+            )
+            return
+        await update.effective_message.reply_text(
+            f"Удалено: {html.escape(key)}" if removed else f"Такого ключа нет: {html.escape(key)}"
+        )
 
     async def cmd_models(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorised(update):
@@ -263,6 +398,7 @@ class TelegramUI:
         self._running[chat_id] = cancel
 
         chat = self._memory.get(chat_id)
+        await self._hydrate(chat)
         model = chat.model or self._profile.model or self._s.model_default
         audit = AuditLog(agent=self._profile.id, chat_id=chat_id)
 
@@ -275,6 +411,7 @@ class TelegramUI:
                 progress=progress,
                 approver=self._make_approver(ctx, chat_id),
                 cancel=cancel,
+                extra_system=await self._facts_prompt(),
             )
             await progress.finish()
             await self._send_long(update, result.text or "(пустой ответ)")
@@ -287,6 +424,11 @@ class TelegramUI:
             )
         finally:
             self._running.pop(chat_id, None)
+            # In `finally` deliberately. A turn that crashed still asked a
+            # question and may have run tools; dropping that half would leave
+            # the next turn reading a transcript that jumps from one user
+            # message straight to another.
+            await self._persist(chat)
 
     # -- approvals -----------------------------------------------------------
 
@@ -367,6 +509,8 @@ class TelegramUI:
         app.add_handler(CommandHandler("start", self.cmd_start))
         app.add_handler(CommandHandler("help", self.cmd_help))
         app.add_handler(CommandHandler("new", self.cmd_new))
+        app.add_handler(CommandHandler("memories", self.cmd_memories))
+        app.add_handler(CommandHandler("forget", self.cmd_forget))
         app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CommandHandler("models", self.cmd_models))
         app.add_handler(CommandHandler("tools", self.cmd_tools))

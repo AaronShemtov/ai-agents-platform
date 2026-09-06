@@ -130,6 +130,24 @@ class Settings(BaseSettings):
     # the source-revision change rather than waiting for its own 10m interval.
     protected_repos: str = "personal-k8s"  # comma-separated
 
+    # --- durable memory (Oracle ADB via ORDS REST-Enabled SQL) -------------
+    # Empty URL or password disables it: history stays in the process and dies
+    # with it, which is what happened before this existed. Not fatal, so the
+    # agent still runs if the database is unreachable at startup — it just
+    # forgets, and says so in the log.
+    #
+    # The URL is the schema's own REST endpoint, e.g.
+    #   https://<host>.oraclecloudapps.com/ords/agents/_/sql
+    # Its own schema, not ADMIN: the same database holds the URL shortener, and
+    # an agent holding the ADMIN password could delete it by accident.
+    adb_sql_url: str = ""
+    adb_username: str = "AGENTS"
+    adb_password: str = ""
+    adb_timeout_seconds: float = 10.0
+    # Messages replayed into a chat after a restart. Trimming by tokens happens
+    # afterwards, so this only bounds how much is read, not what is sent.
+    memory_history_messages: int = 40
+
     # --- limits ------------------------------------------------------------
     max_steps: int = 30
     # How much transcript is sent on a single step.
@@ -165,6 +183,16 @@ class Settings(BaseSettings):
 
     def protected_repo_set(self) -> set[str]:
         return {r.lower() for r in _split(self.protected_repos)}
+
+    def memory_enabled(self) -> bool:
+        """Whether durable memory is configured.
+
+        Both halves are required, and neither has a usable default: a URL with
+        no password gets 401 on every call, and a password with no URL has
+        nowhere to go. Answering False for either means the agent runs with
+        in-process memory instead of failing to start.
+        """
+        return bool(self.adb_sql_url.strip() and self.adb_password.strip())
 
     def mcp_endpoints(self) -> dict[str, str]:
         """Configured MCP servers as {logical name: url}, skipping unset ones."""

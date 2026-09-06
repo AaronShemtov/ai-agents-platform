@@ -21,6 +21,7 @@ from agentcore.llm.router import build_llm
 from agentcore.loop import AgentLoop
 from agentcore.mcp.client import MCPPool, MCPServerConfig
 from agentcore.memory import MemoryStore
+from agentcore.store import AdbStore
 from agentcore.policy import Policy
 from agentcore.profiles import ProfileNotFound, load_profile
 from agentcore.ui import TelegramUI
@@ -96,11 +97,30 @@ async def amain() -> int:
         pool=pool,
         policy=Policy(settings),
     )
+    # Durable memory, if it is configured. Constructed rather than connected:
+    # there is no I/O here, so an unreachable database shows up as a warning on
+    # the first turn instead of a pod that will not start. An agent that forgets
+    # is worth more than one that refuses to run.
+    store = None
+    if settings.memory_enabled():
+        store = AdbStore(
+            base_url=settings.adb_sql_url,
+            username=settings.adb_username,
+            password=settings.adb_password,
+            timeout_seconds=settings.adb_timeout_seconds,
+        )
+        logger.info("durable memory enabled as %s", settings.adb_username)
+    else:
+        logger.warning(
+            "durable memory is not configured; history will be lost on restart"
+        )
+
     ui = TelegramUI(
         settings=settings,
         profile=profile,
         agent_loop=agent_loop,
         memory=MemoryStore(),
+        store=store,
     )
 
     app = ui.build_application()

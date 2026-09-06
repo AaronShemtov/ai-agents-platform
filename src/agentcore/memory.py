@@ -40,11 +40,38 @@ class ChatMemory:
     model: str | None = None  # per-chat override set by /model
     messages: list[dict[str, Any]] = field(default_factory=list)
 
+    # How many of `messages` are already in the durable store. A turn writes
+    # only what it added, rather than re-writing the transcript each time.
+    persisted: int = 0
+
+    # Whether this chat has been loaded from the durable store yet. Set once,
+    # even if the load failed — a database that is down must not be asked again
+    # on every message, and an agent with no memory still answers.
+    hydrated: bool = False
+
     def append(self, message: dict[str, Any]) -> None:
         self.messages.append(message)
 
+    def adopt(self, messages: list[dict[str, Any]]) -> None:
+        """Replace the transcript with one restored from durable storage.
+
+        `persisted` follows, because these messages are by definition already
+        stored; leaving it at zero would write the whole history back on the
+        next turn.
+        """
+        self.messages = list(messages)
+        self.persisted = len(self.messages)
+
+    def unpersisted(self) -> list[dict[str, Any]]:
+        return self.messages[self.persisted :]
+
+    def mark_persisted(self) -> None:
+        self.persisted = len(self.messages)
+
     def reset(self) -> None:
         self.messages.clear()
+        # Not a count of anything that still exists.
+        self.persisted = 0
 
     def transcript(self, system_prompt: str, *, max_tokens: int) -> list[dict[str, Any]]:
         """System prompt plus as much recent history as fits, trimmed by whole turns."""

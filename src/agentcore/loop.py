@@ -141,9 +141,17 @@ class AgentLoop:
         progress: ProgressFn = _noop_progress,
         approver: ApproverFn = _deny_by_default,
         cancel: asyncio.Event | None = None,
+        extra_system: str = "",
     ) -> LoopResult:
         started = time.monotonic()
         chat.append({"role": "user", "content": user_text})
+
+        # What the agent knows about the person it is talking to, supplied by the
+        # caller rather than baked into the profile: the profile is a file in git
+        # and these facts are rows in a database that changes between turns.
+        system_prompt = self._profile.system_prompt
+        if extra_system:
+            system_prompt = system_prompt + "\n\n" + extra_system
 
         catalog = await self.catalog()
         usage = Usage()
@@ -172,7 +180,7 @@ class AgentLoop:
                 break
 
             steps += 1
-            messages = chat.transcript(self._profile.system_prompt, max_tokens=self.max_tokens)
+            messages = chat.transcript(system_prompt, max_tokens=self.max_tokens)
 
             # Timed apart from the turn on purpose: a slow turn is either a slow model
             # or slow tools, and only these two clocks tell the two apart.

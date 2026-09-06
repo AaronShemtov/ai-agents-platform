@@ -8,7 +8,6 @@ happened, about a question nobody was asked.
 
 import asyncio
 from types import SimpleNamespace
-
 from unittest.mock import AsyncMock
 
 from agentcore.config import Settings

@@ -19,6 +19,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import html
+import json
 import logging
 import time
 import uuid
@@ -452,7 +453,6 @@ class TelegramUI:
             future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
             self._pending[token] = future
 
-            preview = ", ".join(f"{k}={_short(v)}" for k, v in list(arguments.items())[:6])
             keyboard = InlineKeyboardMarkup(
                 [
                     [
@@ -461,16 +461,13 @@ class TelegramUI:
                     ]
                 ]
             )
-            await ctx.bot.send_message(
-                chat_id=chat_id,
-                text=(
-                    f"<b>Подтверди действие</b>\n"
-                    f"Инструмент: <code>{html.escape(tool)}</code>\n"
-                    f"Аргументы: <code>{html.escape(preview) or '—'}</code>\n\n"
-                    f"{html.escape(reason)}"
-                ),
-                parse_mode=ParseMode.HTML,
-                reply_markup=keyboard,
+            await self._ask_approval(
+                ctx,
+                chat_id,
+                tool=tool,
+                arguments=arguments,
+                reason=reason,
+                keyboard=keyboard,
             )
             try:
                 return await asyncio.wait_for(future, timeout=APPROVAL_TIMEOUT)
@@ -504,6 +501,52 @@ class TelegramUI:
 
     # -- helpers -------------------------------------------------------------
 
+    async def _ask_approval(
+        self,
+        ctx: ContextTypes.DEFAULT_TYPE,
+        chat_id: int,
+        *,
+        tool: str,
+        arguments: dict[str, Any],
+        reason: str,
+        keyboard: InlineKeyboardMarkup,
+    ) -> None:
+        """Ask for approval, showing the arguments in full.
+
+        They used to be one line: the first six arguments, sixty characters each.
+        For `coder__ask` that line is the entire request — `task` and `context`
+        are two long strings — so what arrived was the first sentence of the task
+        and an ellipsis. Approving an instruction you cannot read is not
+        approving it, so the arguments now go out whole, across as many messages
+        as they take, with the buttons on the last one.
+        """
+        head = (
+            "<b>Подтверди действие</b>\n"
+            f"Инструмент: <code>{html.escape(tool)}</code>\n"
+            "Аргументы:\n"
+        )
+        tail = f"\n{html.escape(reason)}" if reason else ""
+
+        # Escaping grows the text (& becomes &amp;) and the head and reason ride
+        # along, so the per-chunk budget is deliberately well under the limit.
+        budget = max(MAX_MESSAGE - len(head) - len(tail) - 200, 500)
+        chunks = _split(_format_arguments(arguments), budget)
+
+        for index, chunk in enumerate(chunks):
+            last = index == len(chunks) - 1
+            await ctx.bot.send_message(
+                chat_id=chat_id,
+                text=(
+                    (head if index == 0 else "")
+                    + f"<pre>{html.escape(chunk)}</pre>"
+                    + (tail if last else "")
+                ),
+                parse_mode=ParseMode.HTML,
+                # Only the final message decides anything. Buttons on an earlier
+                # chunk would let someone approve a task they are still reading.
+                reply_markup=keyboard if last else None,
+            )
+
     async def _send_long(self, update: Update, text: str) -> None:
         for chunk in _split(text, MAX_MESSAGE):
             await update.effective_message.reply_text(
@@ -535,9 +578,20 @@ class TelegramUI:
         return app
 
 
-def _short(value: Any, limit: int = 60) -> str:
-    text = str(value)
-    return text if len(text) <= limit else text[:limit] + "…"
+def _format_arguments(arguments: dict[str, Any]) -> str:
+    """Every argument, in full, one block each.
+
+    A value that is not a string is shown as JSON rather than as its Python
+    repr: `{'repo': 'x'}` and `{"repo": "x"}` differ by exactly the quoting that
+    makes the second one worth pasting anywhere.
+    """
+    if not arguments:
+        return "—"
+    blocks = []
+    for key, value in arguments.items():
+        shown = value if isinstance(value, str) else json.dumps(value, ensure_ascii=False, indent=2)
+        blocks.append(f"{key}:\n{shown}")
+    return "\n\n".join(blocks)
 
 
 def _looks_like_code(text: str) -> bool:

@@ -61,9 +61,19 @@ async def _noop_progress(_: str) -> None:
     return None
 
 
+class ApprovalUnavailable(RuntimeError):
+    """There is a human to ask in principle, but not from here.
+
+    Raised instead of answering "no", because the two are different facts and the
+    agent reports whichever it is told. The coder profile runs with no UI at all —
+    it is called by the lead agent, not by a person — so telling it the user
+    pressed Reject would have it report a refusal that never happened.
+    """
+
+
 async def _deny_by_default(_tool: str, _args: dict[str, Any], _reason: str) -> bool:
-    """Without a UI able to ask, an approval-required call is refused."""
-    return False
+    """Without a UI able to ask, an approval-required call cannot proceed."""
+    raise ApprovalUnavailable
 
 
 class AgentLoop:
@@ -333,7 +343,28 @@ class AgentLoop:
             # engineering shortens, and on an agent that asks before it changes anything
             # it dominates every other number in the turn.
             asked_at = time.monotonic()
-            approved = await approver(qualified, call.arguments, verdict.reason)
+            try:
+                approved = await approver(qualified, call.arguments, verdict.reason)
+            except ApprovalUnavailable:
+                metrics.record_approval(
+                    agent=audit.agent,
+                    tool=qualified,
+                    outcome="unavailable",
+                    waited_seconds=time.monotonic() - asked_at,
+                )
+                audit.tool_call(
+                    tool=qualified, arguments=call.arguments, decision="unavailable", ok=False
+                )
+                return (
+                    "denied by local policy, not by the remote service: этот вызов "
+                    f"требует подтверждения человека ({verdict.reason}), а здесь "
+                    "спросить некого — ты вызван другим агентом, кнопку показать "
+                    "негде. Повторять бессмысленно. Заверши работу и напиши в ответе, "
+                    "что осталось подтвердить: спросит тот агент, у которого есть "
+                    "человек.",
+                    False,
+                    0,
+                )
             metrics.record_approval(
                 agent=audit.agent,
                 tool=qualified,

@@ -146,3 +146,45 @@ def test_cluster_writes_are_refused_with_a_gitops_explanation() -> None:
 def test_unknown_namespace_requires_approval_rather_than_being_allowed() -> None:
     verdict = make_policy().evaluate("something__do_things", {})
     assert verdict.decision is Decision.REQUIRE_APPROVAL
+
+
+# -- merging into the GitOps repository --------------------------------------
+
+
+def test_protected_repo_merge_asks_instead_of_refusing() -> None:
+    """Merging is a decision to put in front of a person, not one to refuse.
+
+    Denying it did not make anything safer — the pull request still existed and
+    still got merged, just by hand on github.com, which is a worse place to judge
+    a diff than a phone with an Approve button.
+    """
+    verdict = make_policy().evaluate(
+        "github__merge_pull_request", {"repo": "personal-k8s", "pullNumber": 7}
+    )
+    assert verdict.decision is Decision.REQUIRE_APPROVAL
+    # The reason has to say what approving actually does, because it is read on a
+    # phone by someone who was not watching the agent work.
+    assert "Flux" in verdict.reason
+
+
+def test_merging_still_asks_when_the_base_branch_is_named_explicitly() -> None:
+    verdict = make_policy().evaluate(
+        "github__merge_pull_request", {"repo": "personal-k8s", "base": "main"}
+    )
+    assert verdict.decision is Decision.REQUIRE_APPROVAL
+
+
+def test_direct_writes_to_the_protected_default_branch_are_still_refused() -> None:
+    """The concession is merging, and only merging. Pushing to main is still out."""
+    for tool in ("github__create_or_update_file", "github__push_files"):
+        verdict = make_policy().evaluate(tool, {"repo": "personal-k8s", "branch": "main"})
+        assert verdict.decision is Decision.DENY, tool
+
+
+def test_merging_an_ordinary_repo_needs_no_approval() -> None:
+    """Nothing there reaches the cluster, and asking about every one of them is
+    what made the button worth avoiding in the first place."""
+    verdict = make_policy().evaluate(
+        "github__merge_pull_request", {"repo": "urlshortener-backend"}
+    )
+    assert verdict.decision is Decision.ALLOW

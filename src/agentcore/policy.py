@@ -132,6 +132,17 @@ class Policy:
         if repo and repo.lower() in self._protected and targets_default:
             if bare.startswith(("create_pull_request", "create_branch")):
                 return Verdict(Decision.ALLOW)
+            # Merging is not the same act as writing to main, even though both end
+            # up there. A pull request has a diff someone can look at, and refusing
+            # to merge it did not make anything safer — it only moved the click to
+            # github.com, which is a worse place to make the decision than a phone.
+            # So this asks instead of refusing: one button, same human, same diff.
+            if bare.startswith("merge_pull_request"):
+                return Verdict(
+                    Decision.REQUIRE_APPROVAL,
+                    f"слияние PR в {repo}: Flux применит эту ветку к живому кластеру "
+                    "в течение ~10 минут",
+                )
             return Verdict(
                 Decision.DENY,
                 f"{repo} — GitOps-репозиторий, прямая запись в основную ветку запрещена. "

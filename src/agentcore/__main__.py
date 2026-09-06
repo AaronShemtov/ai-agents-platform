@@ -21,9 +21,9 @@ from agentcore.llm.router import build_llm
 from agentcore.loop import AgentLoop
 from agentcore.mcp.client import MCPPool, MCPServerConfig
 from agentcore.memory import MemoryStore
-from agentcore.store import AdbStore
 from agentcore.policy import Policy
 from agentcore.profiles import ProfileNotFound, load_profile
+from agentcore.store import AdbStore
 from agentcore.ui import TelegramUI
 
 logger = logging.getLogger(__name__)

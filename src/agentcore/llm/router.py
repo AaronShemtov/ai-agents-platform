@@ -82,6 +82,9 @@ def build_llm(settings: Settings) -> LLMClient:
         base_url=settings.base_url(),
         api_key=settings.azure_openai_api_key,
         responses_models=settings.responses_api_models(),
+        # Azure's own tools — web search above all. Not passed to Ollama below: these
+        # are executed by the provider, and a self-hosted Ollama has nothing to run.
+        hosted_tools=settings.hosted_tool_specs(),
     )
 
     local = settings.ollama_models()

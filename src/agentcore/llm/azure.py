@@ -75,6 +75,9 @@ class AzureFoundryClient:
         base_url: str,
         api_key: str,
         responses_models: set[str] | None = None,
+        # Tools the provider runs itself, e.g. [{"type": "web_search_preview"}]. Sent
+        # only on /responses, which is the only surface that has them.
+        hosted_tools: list[dict[str, Any]] | None = None,
         headers: dict[str, str] | None = None,
         extra_params: dict[str, Any] | None = None,
         timeout: float = 180.0,
@@ -89,6 +92,7 @@ class AzureFoundryClient:
         if not api_key:
             raise LLMError(f"{label}_API_KEY is not set")
         self._responses_models = responses_models or set()
+        self._hosted_tools = list(hosted_tools or [])
         self._provider = provider
         # Merged into every request. The one thing this is actually for: a reasoning
         # model served by Ollama needs reasoning_effort="none", and that is a property
@@ -192,8 +196,13 @@ class AzureFoundryClient:
         kwargs: dict[str, Any] = {"model": model, "input": items, **self._extra_params}
         if instructions:
             kwargs["instructions"] = instructions
-        if tools:
-            kwargs["tools"] = to_responses_tools(tools)
+        # Our function tools and the provider's own, in one list — the API takes both
+        # kinds together and decides between them. Hosted tools are sent even when we
+        # offer no functions of our own, so that a model with an empty catalogue can
+        # still be asked to look something up.
+        sendable = to_responses_tools(tools or []) + self._hosted_tools
+        if sendable:
+            kwargs["tools"] = sendable
             kwargs["tool_choice"] = "auto"
 
         try:

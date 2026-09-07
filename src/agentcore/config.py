@@ -63,6 +63,23 @@ class Settings(BaseSettings):
     # The codex line rejects /chat/completions with HTTP 400 by design — see
     # agentcore.llm.azure.
     models_responses_api: str = ""  # comma-separated
+    # Tools Azure runs on its own side, named by type and sent alongside our function
+    # tools. `web_search_preview` is the one that matters: it lets the agent read a page
+    # on the open internet, which nothing in our own tool set can do.
+    #
+    # They only exist on /responses, so this applies to the models listed above and is
+    # silently irrelevant to the others — sending a hosted tool to /chat/completions is
+    # not a thing that endpoint understands.
+    #
+    # Nothing here appears in the tool catalogue and nothing here is dispatched by the
+    # loop: Azure executes these and returns the result inside its own output items,
+    # which our parser carries through untouched.
+    #
+    # Measured on this resource 2026-09-07 — the accepted types are code_interpreter,
+    # programmatic_tool_calling, function, namespace, tool_search, file_search,
+    # web_search_preview, image_generation, mcp, custom, computer, computer_use_preview,
+    # shell and apply_patch. An unknown name is rejected with HTTP 400 listing them.
+    hosted_tools: str = ""  # comma-separated
 
     # --- Ollama (self-hosted, OpenAI-compatible) ---------------------------
     # Ollama serves the OpenAI wire protocol at <host>:11434/v1/, so it needs no client
@@ -207,6 +224,10 @@ class Settings(BaseSettings):
     def responses_api_models(self) -> set[str]:
         """Deployments to call over /responses instead of /chat/completions."""
         return set(_split(self.models_responses_api))
+
+    def hosted_tool_specs(self) -> list[dict[str, str]]:
+        """Server-side tools as the Responses API wants them: just a type."""
+        return [{"type": name} for name in _split(self.hosted_tools)]
 
     def allowed_models(self) -> list[str]:
         """Models selectable via /model, always including the default."""

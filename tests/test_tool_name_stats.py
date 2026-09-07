@@ -1,5 +1,6 @@
 """Names in AI stats describe actual per-turn executions, not proposals."""
 
+import html
 import json
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
@@ -13,9 +14,9 @@ from agentcore.mcp.client import ToolResult
 from agentcore.mcp.toolset import ToolCatalog
 from agentcore.memory import ChatMemory
 from agentcore.policy import Decision
+from agentcore.ui.telegram import MAX_MESSAGE, TelegramUI
 from agentcore.ui.usage import format_usage_footer as ui_footer
 from agentcore.usage_display import format_usage_footer
-
 
 FORMATTERS = [format_usage_footer, ui_footer]
 
@@ -55,6 +56,29 @@ def test_long_list_is_not_silently_truncated(formatter):
     )
     assert len(footer) > 4096
     assert names_from_footer(footer) == list(names)
+
+
+@pytest.mark.asyncio
+async def test_telegram_sends_complete_long_array_with_html_escaping():
+    names = [f"test__read_{i:04d}<tag>&" for i in range(300)]
+    footer = format_usage_footer(
+        model="m", steps=2, usage=Usage(), duration_ms=0,
+        tool_calls=len(names), tool_names=names,
+    )
+    reply = AsyncMock()
+    update = SimpleNamespace(effective_message=SimpleNamespace(reply_text=reply))
+    await TelegramUI._send_long(None, update, footer)
+    assert reply.await_count > 1
+    decoded = []
+    for call in reply.await_args_list:
+        rendered = call.args[0]
+        assert "<tag>" not in rendered
+        chunk = html.unescape(rendered.removeprefix("<pre>").removesuffix("</pre>"))
+        assert len(chunk) <= MAX_MESSAGE
+        decoded.append(chunk)
+    reconstructed = "".join(decoded)
+    assert reconstructed == footer
+    assert names_from_footer(reconstructed) == names
 
 
 class FakeAudit:

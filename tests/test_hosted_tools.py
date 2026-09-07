@@ -36,6 +36,16 @@ class FakeResponses:
         return SimpleNamespace(output=[], usage=None, status="completed")
 
 
+class FakeMessage:
+    """The chat path calls model_dump() on the provider's message object."""
+
+    content = "ok"
+    tool_calls = None
+
+    def model_dump(self, **_kwargs):
+        return {"role": "assistant", "content": self.content}
+
+
 class FakeChat:
     def __init__(self):
         self.kwargs = None
@@ -43,12 +53,7 @@ class FakeChat:
     async def create(self, **kwargs):
         self.kwargs = kwargs
         return SimpleNamespace(
-            choices=[
-                SimpleNamespace(
-                    message=SimpleNamespace(content="ok", tool_calls=None),
-                    finish_reason="stop",
-                )
-            ],
+            choices=[SimpleNamespace(message=FakeMessage(), finish_reason="stop")],
             usage=None,
         )
 

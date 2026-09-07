@@ -136,15 +136,38 @@ jobs:
             printf '%s\n' "<a href=\"${RUN_URL}\">workflow run</a>"
           } > /tmp/tg-msg.txt
 
-          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+          # `-o /dev/null` with no --fail is how this went quiet for two days: curl
+          # exits 0 on an HTTP 401 as readily as on a 200, so a rejected message left
+          # a green step and nobody knew. Telegram also answers 200 with
+          # {"ok":false} for some errors, so the status code alone is not enough —
+          # the body has to be read.
+          #
+          # The token never reaches the log: it is only ever in the URL, and what is
+          # printed is Telegram's own `description` field.
+          code=$(curl -sS -o /tmp/tg-resp.json -w '%{http_code}' \
+            -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TG_CHAT}" \
             --data-urlencode "text@/tmp/tg-msg.txt" \
             --data-urlencode "parse_mode=HTML" \
-            --data-urlencode "disable_web_page_preview=true" \
-            -o /dev/null
+            --data-urlencode "disable_web_page_preview=true")
+
+          if grep -q '"ok":true' /tmp/tg-resp.json; then
+            echo "Telegram accepted the notification (HTTP $code)"
+          else
+            echo "::error::Telegram rejected the notification (HTTP $code)"
+            # Telegram's own wording, e.g. "Unauthorized" or "chat not found".
+            # The response never contains the token.
+            cat /tmp/tg-resp.json
+            echo "Check the TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID repository secrets."
+            exit 1
+          fi
 
       - name: Notify Telegram — failure
         if: failure()
+        # The job is already red for its own reason. A Telegram problem on top of
+        # that should be visible in the log but must not become the headline, or the
+        # actual failure gets buried under it.
+        continue-on-error: true
         env:
           TG_TOKEN: ${{ secrets.TELEGRAM_BOT_TOKEN }}
           TG_CHAT:  ${{ secrets.TELEGRAM_CHAT_ID }}
@@ -161,9 +184,28 @@ jobs:
             printf '%s\n' "<a href=\"${RUN_URL}\">workflow run · check logs</a>"
           } > /tmp/tg-msg.txt
 
-          curl -sS -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
+          # `-o /dev/null` with no --fail is how this went quiet for two days: curl
+          # exits 0 on an HTTP 401 as readily as on a 200, so a rejected message left
+          # a green step and nobody knew. Telegram also answers 200 with
+          # {"ok":false} for some errors, so the status code alone is not enough —
+          # the body has to be read.
+          #
+          # The token never reaches the log: it is only ever in the URL, and what is
+          # printed is Telegram's own `description` field.
+          code=$(curl -sS -o /tmp/tg-resp.json -w '%{http_code}' \
+            -X POST "https://api.telegram.org/bot${TG_TOKEN}/sendMessage" \
             --data-urlencode "chat_id=${TG_CHAT}" \
             --data-urlencode "text@/tmp/tg-msg.txt" \
             --data-urlencode "parse_mode=HTML" \
-            --data-urlencode "disable_web_page_preview=true" \
-            -o /dev/null
+            --data-urlencode "disable_web_page_preview=true")
+
+          if grep -q '"ok":true' /tmp/tg-resp.json; then
+            echo "Telegram accepted the notification (HTTP $code)"
+          else
+            echo "::error::Telegram rejected the notification (HTTP $code)"
+            # Telegram's own wording, e.g. "Unauthorized" or "chat not found".
+            # The response never contains the token.
+            cat /tmp/tg-resp.json
+            echo "Check the TELEGRAM_BOT_TOKEN and TELEGRAM_CHAT_ID repository secrets."
+            exit 1
+          fi

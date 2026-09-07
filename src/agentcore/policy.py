@@ -109,6 +109,14 @@ class Policy:
                 "Чтобы изменить кластер, отредактируй манифесты в personal-k8s и открой PR.",
             )
 
+        if server == "reviewer":
+            # An agent that only reads. Its profile lists read tools by name and
+            # denies every writing verb, so the worst it can do is return a wrong
+            # opinion — and the point of having it is that the lead asks it without
+            # being nagged into skipping the step. Gating review behind a button is
+            # how review stops happening.
+            return Verdict(Decision.ALLOW)
+
         if server == MEMORY_SERVER:
             # The agent's own two tables, under a database user with no grants
             # on anything else — `select from admin.urls` as it is ORA-00942.

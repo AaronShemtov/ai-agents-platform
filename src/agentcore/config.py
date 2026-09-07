@@ -132,6 +132,9 @@ class Settings(BaseSettings):
     # A worker agent exposed as an MCP server — see src/mcp_agent. Empty means this
     # deployment has no one to delegate to.
     mcp_coder_url: str = ""
+    # The same mechanism, for the agent that reads code instead of writing it. Its
+    # profile has no write tools at all, so this is safe to reach without asking.
+    mcp_reviewer_url: str = ""
 
     # The official GitHub MCP server in `http` mode has NO token field: it requires
     # `Authorization: Bearer <PAT>` on every request. So the PAT lives here, in the
@@ -218,6 +221,7 @@ class Settings(BaseSettings):
             "cloudflare": self.mcp_cloudflare_url,
             "cluster": self.mcp_cluster_url,
             "coder": self.mcp_coder_url,
+            "reviewer": self.mcp_reviewer_url,
         }
         return {name: url for name, url in candidates.items() if url}
 

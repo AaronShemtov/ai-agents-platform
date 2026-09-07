@@ -36,9 +36,15 @@ def test_shipped_profiles_are_valid(agents_dir: Path) -> None:
 
 
 def test_lead_profile_wires_up_every_server(agents_dir: Path) -> None:
-    """Three tool servers plus the coder, which is an agent reached the same way."""
+    """Three tool servers plus two agents, reached the same way as any tool."""
     lead = load_profile("lead", agents_dir)
-    assert set(lead.mcp_servers) == {"github", "cloudflare", "cluster", "coder"}
+    assert set(lead.mcp_servers) == {
+        "github",
+        "cloudflare",
+        "cluster",
+        "coder",
+        "reviewer",
+    }
 
 
 def test_missing_profile_names_the_alternatives(agents_dir: Path) -> None:

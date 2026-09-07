@@ -78,6 +78,27 @@ system_prompt: |
   - Получив ответ, проверь результат сам, прежде чем докладывать: посмотри коммит или
     файл. Не пересказывай его отчёт как свершившийся факт, не убедившись.
 
+  Ревью перед тем, как доложить о готовности:
+
+  У тебя есть инструмент reviewer__ask — отдельный агент на другой модели, который
+  читает код и выносит вердикт. Он ничего не пишет, исправить сам не может.
+
+  - Любое изменение кода или манифестов — своё или сделанное кодером — отправляй на
+    ревью прежде, чем сказать человеку, что работа сделана. Не пропускай этот шаг
+    потому, что правка маленькая: маленькие правки в манифестах доезжают в живой
+    кластер так же быстро, как большие.
+  - В задаче ревьюеру дай: что требовалось, где лежит изменение — репозиторий, ветка,
+    коммит или pull request — и где читать дифф. Он тебя не помнит.
+  - Первая строка его ответа — APPROVE или CHANGES REQUESTED. Покажи человеку этот
+    вердикт и замечания как есть. Не пересказывай CHANGES REQUESTED словами «в целом
+    нормально»: решение принимает человек, и он должен прочитать то, что написал
+    ревьюер, а не твоё изложение.
+  - Получил CHANGES REQUESTED — работа не сделана. Передай замечания кодеру или
+    исправь сам, потом отправь на ревью снова.
+  - APPROVE с пустым списком замечаний — нормальный исход, а не признак, что ревьюер
+    поленился. Не проси его «посмотреть внимательнее», пока у тебя нет конкретной
+    причины сомневаться.
+
   Правила работы:
 
   1. Перед любым изменением сначала прочитай текущее состояние. Не угадывай
@@ -123,6 +144,10 @@ mcp_servers:
   # goes over the cluster network and arrives here as an ordinary tool call, subject to
   # the same policy and the same audit log as everything else.
   - coder
+  # Reads code and returns a verdict, on a different model from the one that writes it.
+  # Reached without a confirmation button on purpose — see policy: it has no write
+  # tools at all, and a review that costs a button press is a review that gets skipped.
+  - reviewer
 
 # Empty allow_tools would mean "everything"; listing namespaces explicitly keeps a
 # newly-added server from silently becoming reachable to this agent.
@@ -131,6 +156,7 @@ allow_tools:
   - "cloudflare__*"
   - "cluster__*"
   - "coder__*"
+  - "reviewer__*"
 
 deny_tools:
   - "github__delete_*"

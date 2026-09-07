@@ -57,6 +57,7 @@ class LoopResult:
     duration_ms: int = 0
     tool_calls: int = 0
     tool_duration_ms: int = 0
+    tool_names: list[str] = field(default_factory=list)
 
 
 async def _noop_progress(_: str) -> None:
@@ -169,6 +170,7 @@ class AgentLoop:
         answer = ""
         tool_calls = 0
         tool_duration_ms = 0
+        tool_names: list[str] = []
 
         while steps < self.max_steps:
             if cancel is not None and cancel.is_set():
@@ -273,6 +275,7 @@ class AgentLoop:
                 if called:
                     tool_calls += 1
                     tool_duration_ms += duration_ms
+                    tool_names.append(catalog.resolve(call.name) or call.name)
                 chat.append(
                     {"role": "tool", "tool_call_id": call.id, "content": _clip(result_text)}
                 )
@@ -293,6 +296,7 @@ class AgentLoop:
                 duration_ms=duration_ms,
                 tool_calls=tool_calls,
                 tool_duration_ms=tool_duration_ms,
+                tool_names=tool_names,
                 stopped_because=stopped,
             ),
         )
@@ -317,6 +321,7 @@ class AgentLoop:
             duration_ms=duration_ms,
             tool_calls=tool_calls,
             tool_duration_ms=tool_duration_ms,
+            tool_names=tool_names,
         )
 
     # -- one tool call -------------------------------------------------------

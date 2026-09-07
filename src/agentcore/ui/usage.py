@@ -8,6 +8,9 @@ from this value.
 
 from __future__ import annotations
 
+import json
+from collections.abc import Sequence
+
 from agentcore.llm.base import Usage
 
 
@@ -20,6 +23,7 @@ def format_usage_footer(
     tool_calls: int = 0,
     tool_duration_ms: int = 0,
     stopped_because: str = "completed",
+    tool_names: Sequence[str] = (),
 ) -> str:
     """Return a compact plain-text footer safe for Telegram HTML rendering."""
     return (
@@ -29,6 +33,7 @@ def format_usage_footer(
         f"cached={usage.cached_tokens:,} ({usage.cache_hit_pct}%)\n"
         f"reasoning={usage.reasoning_tokens:,} · billable={usage.billable:,}\n"
         f"duration={_duration(duration_ms)} · tools={tool_calls} ({_duration(tool_duration_ms)})"
+        f" {json.dumps(list(tool_names), ensure_ascii=False)}"
     )
 
 

@@ -1,0 +1,53 @@
+name: Prepare tool-name stats on feature branch
+
+on:
+  push:
+    branches: [feat/telegram-tool-name-stats]
+    paths:
+      - .github/prepare_tool_name_stats.py
+      - .github/workflows/prepare-tool-name-stats.yml
+
+permissions:
+  contents: write
+
+concurrency:
+  group: prepare-tool-name-stats
+  cancel-in-progress: false
+
+jobs:
+  prepare:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: feat/telegram-tool-name-stats
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+          cache: pip
+      - name: Apply exact source patch
+        run: python .github/prepare_tool_name_stats.py | tee /tmp/tool-name-source.txt
+      - name: Install test dependencies
+        run: pip install -e '.[dev]' > /tmp/tool-name-install.txt 2>&1
+      - name: Lint
+        run: ruff check src tests 2>&1 | tee /tmp/tool-name-lint.txt
+      - name: Test
+        run: pytest -q 2>&1 | tee /tmp/tool-name-tests.txt
+      - name: Commit validated source only and remove preparation files
+        run: |
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git rm .github/prepare_tool_name_stats.py .github/workflows/prepare-tool-name-stats.yml
+          git add src/agentcore/loop.py src/agentcore/usage_display.py src/agentcore/ui/usage.py tests/test_tool_name_stats.py
+          git commit -m 'Show ordered tool-name arrays in AI stats' -m "$(cat /tmp/tool-name-lint.txt; tail -n 3 /tmp/tool-name-tests.txt)" -m "$(cat /tmp/tool-name-source.txt)"
+          git push origin HEAD:feat/telegram-tool-name-stats
+      - name: Publish bounded failure diagnostics without committing source changes
+        if: failure()
+        run: |
+          { for f in /tmp/tool-name-source.txt /tmp/tool-name-install.txt /tmp/tool-name-lint.txt /tmp/tool-name-tests.txt; do if [ -f "$f" ]; then echo "--- $f ---"; tail -n 50 "$f"; fi; done; } | tail -c 11000 > tool-name-stats-diagnostics.txt
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+          git reset
+          git add tool-name-stats-diagnostics.txt
+          git commit -m 'Report tool-name stats preparation failure' || exit 0
+          git push origin HEAD:feat/telegram-tool-name-stats

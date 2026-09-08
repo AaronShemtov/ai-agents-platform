@@ -21,6 +21,7 @@ import contextlib
 import html
 import json
 import logging
+import re
 import time
 import uuid
 from typing import Any
@@ -43,6 +44,7 @@ from agentcore.loop import AgentLoop
 from agentcore.memory import ChatMemory, MemoryStore
 from agentcore.profiles import AgentProfile
 from agentcore.store import AdbStore
+from agentcore.ui import tgmd
 
 logger = logging.getLogger(__name__)
 
@@ -75,6 +77,11 @@ class ProgressReporter:
             return
         self._last_edit = now
         body = "\n".join(html.escape(line) for line in self._lines)
+        # An edit cannot be split, so this has to fit. The failure it replaces
+        # was silent: BadRequest is suppressed below, so an over-long body left
+        # the status message frozen with no explanation anywhere.
+        if tgmd.utf16_len(body) > tgmd.MAX_MESSAGE:
+            body = body[: tgmd.MAX_MESSAGE // 2] + "\n…"
         with contextlib.suppress(BadRequest):
             # BadRequest is expected when the text has not changed since the last edit.
             await self._bot.edit_message_text(
@@ -262,20 +269,22 @@ class TelegramUI:
                 "я сам сохраняю то, что пригодится в следующих разговорах."
             )
             return
+        # Markdown through _send_long, which renders, escapes, and splits on tag
+        # boundaries. Assembling HTML here and slicing it at a character offset
+        # meant a cut could land inside <code> — and Telegram answers 400 to
+        # that, so the whole list went missing rather than arriving in halves.
+        # updated_at also went out unescaped. Backticks keep the key
+        # copy-pasteable into /forget.
         lines = [
-            f"<code>{html.escape(f.key)}</code> — {html.escape(f.fact)}"
-            + (f" <i>({f.updated_at})</i>" if f.updated_at else "")
+            f"`{f.key}` — {f.fact}" + (f" ({f.updated_at})" if f.updated_at else "")
             for f in facts
         ]
-        # Not _send_long: that escapes its input, and these lines are already
-        # HTML on purpose — the key has to be copy-pasteable into /forget.
-        body = (
+        await self._send_long(
+            update,
             "Что я о тебе помню:\n\n"
             + "\n\n".join(lines)
-            + "\n\nУдалить: <code>/forget ключ</code>"
+            + "\n\nУдалить: `/forget ключ`",
         )
-        for chunk in _split(body, MAX_MESSAGE):
-            await update.effective_message.reply_text(chunk, parse_mode=ParseMode.HTML)
 
     async def cmd_forget(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorised(update):
@@ -295,11 +304,17 @@ class TelegramUI:
         except Exception as exc:
             logger.exception("forget failed")
             await update.effective_message.reply_text(
-                f"Не смог удалить: {html.escape(type(exc).__name__)}"
+                f"Не смог удалить: {html.escape(type(exc).__name__)}",
+                parse_mode=ParseMode.HTML,
             )
             return
+        # Escaping without parse_mode is what showed the entity to the reader:
+        # with no renderer there is nothing to turn it back into a character.
         await update.effective_message.reply_text(
-            f"Удалено: {html.escape(key)}" if removed else f"Такого ключа нет: {html.escape(key)}"
+            f"Удалено: {html.escape(key)}"
+            if removed
+            else f"Такого ключа нет: {html.escape(key)}",
+            parse_mode=ParseMode.HTML,
         )
 
     async def cmd_models(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -349,9 +364,11 @@ class TelegramUI:
             name = spec["function"]["name"]
             server, _, bare = name.partition("__")
             by_server.setdefault(server, []).append(bare or name)
+        # Markdown, not HTML: _send_long renders and escapes it. Handing it
+        # ready-made tags is what made this arrive with visible entities — the
+        # escape pass downstream had no way to know the tags were ours.
         chunks = [
-            f"<b>{html.escape(server)}</b> ({len(names)}): "
-            + ", ".join(html.escape(n) for n in sorted(names))
+            f"**{server}** ({len(names)}): " + ", ".join(sorted(names))
             for server, names in sorted(by_server.items())
         ]
         await self._send_long(update, "\n\n".join(chunks))
@@ -434,7 +451,10 @@ class TelegramUI:
             logger.exception("turn failed")
             await progress.finish()
             await update.effective_message.reply_text(
-                f"Сломалось: {html.escape(type(exc).__name__)}: {html.escape(str(exc))[:500]}",
+                # Truncate first, escape second. The other order can cut an
+                # entity in half and make the crash report undeliverable.
+                f"Сломалось: {html.escape(type(exc).__name__)}: "
+                f"{html.escape(str(exc)[:500])}",
                 parse_mode=ParseMode.HTML,
             )
         finally:
@@ -548,11 +568,26 @@ class TelegramUI:
             )
 
     async def _send_long(self, update: Update, text: str) -> None:
-        for chunk in _split(text, MAX_MESSAGE):
-            await update.effective_message.reply_text(
-                f"<pre>{html.escape(chunk)}</pre>" if _looks_like_code(chunk) else html.escape(chunk),
-                parse_mode=ParseMode.HTML,
-            )
+        """Send Markdown as Telegram-renderable HTML, in as many messages as it takes.
+
+        This used to html.escape() the text and post it with parse_mode=HTML,
+        which is not a translation: `**bold**` and `###` are not HTML, so
+        Telegram found no markup to render and printed the source characters.
+        Rendering, escaping and splitting belong together and now live in tgmd.
+
+        Falls back to plain text if Telegram refuses the markup. A message the
+        reader sees unformatted beats the silence of a 400 nobody logs.
+        """
+        for chunk in tgmd.render(text):
+            try:
+                await update.effective_message.reply_text(
+                    chunk, parse_mode=ParseMode.HTML
+                )
+            except BadRequest:
+                logger.warning("telegram rejected rendered HTML; sending as text")
+                await update.effective_message.reply_text(
+                    _strip_tags(chunk), parse_mode=None
+                )
 
     def build_application(self) -> Application:
         app = (
@@ -594,9 +629,19 @@ def _format_arguments(arguments: dict[str, Any]) -> str:
     return "\n\n".join(blocks)
 
 
-def _looks_like_code(text: str) -> bool:
-    return text.count("\n") > 3 and any(
-        marker in text for marker in ("{", "}", "def ", "apiVersion", "  ")
+def _strip_tags(html_text: str) -> str:
+    """Last-resort plain text, for when Telegram refuses the markup.
+
+    Only reached on the fallback path. The tags are ours and few, so unwrapping
+    them and turning the entities back into characters is enough to make the
+    message readable without pulling in a parser.
+    """
+    text = re.sub(r"<[^>]+>", "", html_text)
+    return (
+        text.replace("&lt;", "<")
+        .replace("&gt;", ">")
+        .replace("&quot;", chr(34))
+        .replace("&amp;", "&")
     )
 
 

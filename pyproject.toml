@@ -23,6 +23,11 @@ dependencies = [
     # easy to get subtly wrong — histogram bucket accumulation especially — and this is
     # the library every Prometheus scraper is tested against.
     "prometheus-client>=0.21",
+    # CommonMark, so the Telegram renderer does not have to decide what emphasis
+    # is with regexes. Left/right-flanking delimiter runs are what keep
+    # MAX_TOKENS_PER_TURN and 2 * 3 intact, and getting that wrong corrupts text
+    # silently. Pure Python, no build step, arm64 like everything else here.
+    "markdown-it-py>=3.0,<5",
 ]
 
 [project.optional-dependencies]

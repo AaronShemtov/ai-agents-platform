@@ -118,6 +118,19 @@ class Settings(BaseSettings):
     #
     # Raise it to low/medium per deployment for a role that genuinely benefits.
     ollama_reasoning_effort: str = "none"
+    # What a locally served model is handed, which is not what a hosted one gets.
+    #
+    # Measured on this box with qwen3.5:0.8b: the lead's own transcript reached
+    # 30,340 tokens and the reply took 19s; with the 61-tool catalogue attached
+    # the request never came back at all — Cloudflare answered 524 because
+    # prefill outlasts the tunnel's 100s origin timeout. Neither is a model
+    # fault: it is a prompt that more hardware would not rescue either.
+    #
+    # Tools are off because a small model does not produce usable tool calls and
+    # their definitions alone dominate the prompt: 61 of them cost about 10k
+    # tokens before the conversation starts.
+    local_max_tokens: int = 6000
+    local_tools: bool = False
 
     # --- Telegram ----------------------------------------------------------
     telegram_bot_token: str = ""
@@ -247,6 +260,14 @@ class Settings(BaseSettings):
     def ollama_models(self) -> set[str]:
         """Models to route to Ollama rather than to Azure."""
         return set(_split(self.models_ollama))
+
+    def is_local_model(self, model: str) -> bool:
+        """Whether this model is served from the self-hosted box.
+
+        The distinction the loop needs is not "which vendor" but "what can this
+        endpoint be given": no tool catalogue and a far smaller transcript.
+        """
+        return model in self.ollama_models()
 
     def ollama_request_headers(self) -> dict[str, str]:
         """Every header the gate in front of Ollama expects.

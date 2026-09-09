@@ -163,7 +163,18 @@ class AgentLoop:
         if extra_system:
             system_prompt = system_prompt + "\n\n" + extra_system
 
-        catalog = await self.catalog()
+        # A locally served model gets a different deal: no tool catalogue and a
+        # much smaller transcript. See Settings.local_max_tokens for the
+        # measurements — the short version is that 61 tool definitions plus a
+        # 30k transcript is a request the tunnel in front of Ollama times out on,
+        # and a 0.8B model answers by inventing work it never did.
+        local = self._settings.is_local_model(model)
+        if local and not self._settings.local_tools:
+            catalog = ToolCatalog(specs=[], _by_openai_name={}, skipped=[])
+            logger.info("model %s is served locally: tools withheld", model)
+        else:
+            catalog = await self.catalog()
+        token_budget = self._settings.local_max_tokens if local else self.max_tokens
         usage = Usage()
         steps = 0
         stopped = "completed"
@@ -191,7 +202,7 @@ class AgentLoop:
                 break
 
             steps += 1
-            messages = chat.transcript(system_prompt, max_tokens=self.max_tokens)
+            messages = chat.transcript(system_prompt, max_tokens=token_budget)
 
             # Timed apart from the turn on purpose: a slow turn is either a slow model
             # or slow tools, and only these two clocks tell the two apart.

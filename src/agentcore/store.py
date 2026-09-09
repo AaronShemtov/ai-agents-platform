@@ -81,6 +81,74 @@ def _bind(name: str, value: Any) -> dict[str, Any]:
     return {"name": name, "data_type": kind, "value": text}
 
 
+def replayable(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """Trim a restored window down to something an endpoint will accept.
+
+    `history` takes the newest N rows, and N counts messages rather than turns,
+    so the window routinely begins in the middle of one. A window that starts on
+    a `tool` message is not merely untidy — /chat/completions rejects the whole
+    request with 400 "messages with role 'tool' must be a response to a
+    preceeding message with 'tool_calls'", and since the same window is replayed
+    on every following message, the conversation stays broken until it is
+    cleared. Observed exactly that on a 322-message chat whose 40-message window
+    opened on an orphaned tool result.
+
+    It only surfaced when the lead moved to a /chat/completions model. The
+    Responses API had been tolerating the same malformed history, which is worth
+    knowing: this was latent for as long as the default was a codex or astra
+    deployment, and a model switch is what made it visible.
+
+    Three rules, all about turn boundaries:
+
+      * Drop everything before the first `user` message. That is the only
+        unambiguous start of a turn, and it is already how memory._split_into_turns
+        defines one.
+      * Drop a `tool` message that no preceding assistant asked for. A turn
+        persisted halfway — the process died between two appends — can leave one.
+      * Drop a trailing assistant whose tool calls were never answered, for the
+        same reason in the other direction.
+    """
+    first_user = next(
+        (i for i, m in enumerate(messages) if m.get("role") == "user"), None
+    )
+    if first_user is None:
+        # Nothing but a fragment: replaying it can only produce a 400, and an
+        # agent with no history answers fine.
+        return []
+
+    out: list[dict[str, Any]] = []
+    awaiting: set[str] = set()
+    for message in messages[first_user:]:
+        role = message.get("role")
+        if role == "tool":
+            if message.get("tool_call_id") not in awaiting:
+                log.warning("dropping a tool message no assistant asked for")
+                continue
+            awaiting.discard(message["tool_call_id"])
+        elif role == "assistant":
+            awaiting = {
+                call.get("id")
+                for call in (message.get("tool_calls") or [])
+                if call.get("id")
+            }
+        else:
+            awaiting = set()
+        out.append(message)
+
+    if awaiting:
+        # Cut back to before the assistant whose calls went unanswered. Popping
+        # only the last message is not enough: with two calls answered once, the
+        # tail is `assistant, tool` and a partial set of results is rejected just
+        # as an empty one is.
+        for index in range(len(out) - 1, -1, -1):
+            if out[index].get("role") == "assistant" and out[index].get("tool_calls"):
+                log.warning("dropping an assistant turn whose tool calls went unanswered")
+                del out[index:]
+                break
+
+    return out
+
+
 @dataclass(frozen=True)
 class Fact:
     key: str
@@ -219,7 +287,7 @@ class AdbStore:
             if row.get("tool_call_id"):
                 message["tool_call_id"] = row["tool_call_id"]
             messages.append(message)
-        return messages
+        return replayable(messages)
 
     async def clear(self, *, agent: str, chat_id: int) -> None:
         """Forget one conversation — what /new means once history is durable."""

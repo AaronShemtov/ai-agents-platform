@@ -140,14 +140,23 @@ async def test_tool_calls_come_back_as_structure_not_text(ords: str) -> None:
         (
             200,
             rows(
+                # Newest first, the way the descending query returns them, and
+                # a whole turn rather than a fragment: history() now refuses a
+                # window that opens or closes mid-turn, because an endpoint
+                # rejects both an orphaned tool result and a tool call with no
+                # result — and the replay would 400 on every message after.
+                {"role": "tool", "content": "you are Aaron",
+                 "tool_calls": None, "tool_call_id": "1"},
                 {"role": "assistant", "content": None,
                  "tool_calls": '[{"id": "1", "name": "github__get_me"}]',
-                 "tool_call_id": None}
+                 "tool_call_id": None},
+                {"role": "user", "content": "кто я?", "tool_calls": None,
+                 "tool_call_id": None},
             ),
         )
     )
     history = await store(ords).history(agent="lead", chat_id=7, limit=10)
-    assert history[0]["tool_calls"] == [{"id": "1", "name": "github__get_me"}]
+    assert history[1]["tool_calls"] == [{"id": "1", "name": "github__get_me"}]
 
 
 async def test_an_empty_tool_call_id_is_left_off_entirely(ords: str) -> None:
@@ -162,12 +171,17 @@ async def test_an_empty_tool_call_id_is_left_off_entirely(ords: str) -> None:
 
 async def test_unparseable_tool_calls_lose_the_field_not_the_message(ords: str) -> None:
     _replies.append(
-        (200, rows({"role": "assistant", "content": "still useful",
-                    "tool_calls": "{not json", "tool_call_id": None}))
+        (200, rows(
+            # Newest first, as the descending query returns them.
+            {"role": "assistant", "content": "still useful",
+             "tool_calls": "{not json", "tool_call_id": None},
+            {"role": "user", "content": "спроси", "tool_calls": None,
+             "tool_call_id": None},
+        ))
     )
     history = await store(ords).history(agent="lead", chat_id=7, limit=10)
-    assert history[0]["content"] == "still useful"
-    assert "tool_calls" not in history[0]
+    assert history[1]["content"] == "still useful"
+    assert "tool_calls" not in history[1]
 
 
 # -- what happens when the database is not there -----------------------------

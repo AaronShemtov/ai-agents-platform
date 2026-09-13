@@ -129,7 +129,12 @@ class Settings(BaseSettings):
     # Tools are off because a small model does not produce usable tool calls and
     # their definitions alone dominate the prompt: 61 of them cost about 10k
     # tokens before the conversation starts.
-    local_max_tokens: int = 3000
+    # 2,000 rather than 3,000, now that the window snaps to whole blocks instead
+    # of sliding. The expensive turn — the one that re-reads everything — arrives
+    # once every TRIM_STEP turns, so what matters is its cost: ~2,000 tokens is
+    # around 60s cold on this box, against ~90s at 3,000, and the 125s ceiling
+    # has to cover the answer as well.
+    local_max_tokens: int = 2000
     local_tools: bool = False
     # The profile's own system prompt, replaced for locally served models.
     #

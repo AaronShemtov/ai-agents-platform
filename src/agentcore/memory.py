@@ -34,6 +34,12 @@ def estimate_tokens(messages: list[dict[str, Any]]) -> int:
     return int(chars / _CHARS_PER_TOKEN)
 
 
+# How many turns the start of the history is snapped to. Four is a compromise:
+# one expensive re-read buys three cheap turns, and the history carried is never
+# more than four turns short of the budget. See ChatMemory.transcript.
+TRIM_STEP = 4
+
+
 @dataclass
 class ChatMemory:
     chat_id: int
@@ -73,13 +79,36 @@ class ChatMemory:
         # Not a count of anything that still exists.
         self.persisted = 0
 
-    def transcript(self, system_prompt: str, *, max_tokens: int) -> list[dict[str, Any]]:
-        """System prompt plus as much recent history as fits, trimmed by whole turns."""
+    def transcript(
+        self, system_prompt: str, *, max_tokens: int, step: int = TRIM_STEP
+    ) -> list[dict[str, Any]]:
+        """System prompt plus as much recent history as fits, trimmed by whole turns.
+
+        Where the history starts is snapped to a multiple of `step` turns, and
+        that is the whole point. Trimming to exactly what fits moves the first
+        message on every single turn once the budget is reached, and a prefix
+        that changes at token one is a prefix no cache can match.
+
+        Measured on the local box, budget 1,200: while the window held still a
+        turn cost 2.9s and 11.4s; the two turns where it slid cost 30.1s and
+        29.7s, all four with the same amount of context. The difference is
+        re-reading 1,100 tokens that had already been read.
+
+        It is not only a latency question. Azure bills a cached input token at a
+        tenth of a fresh one, so a prefix that survives is also the cheaper one —
+        and the turn where sol spent 43.1M input tokens is what that costs when
+        it does not.
+
+        Rounding up rather than down: the snapped start drops at least as many
+        turns as the budget required, so the result still fits. The price is
+        carrying a little less history than the budget would allow, paid once per
+        `step` turns instead of a full re-read every turn.
+        """
         system = {"role": "system", "content": system_prompt}
         budget = max_tokens - estimate_tokens([system])
 
         turns = _split_into_turns(self.messages)
-        kept: list[list[dict[str, Any]]] = []
+        kept = 0
         used = 0
         for turn in reversed(turns):
             cost = estimate_tokens(turn)
@@ -87,10 +116,16 @@ class ChatMemory:
             # dropping it would mean answering with no idea what was asked.
             if kept and used + cost > budget:
                 break
-            kept.append(turn)
+            kept += 1
             used += cost
 
-        history = [msg for turn in reversed(kept) for msg in turn]
+        start = len(turns) - kept
+        if step > 1 and start > 0:
+            # Snap forward to the next multiple of `step`, never past the last
+            # turn: the newest one is the question being answered.
+            start = min(-(-start // step) * step, len(turns) - 1)
+
+        history = [msg for turn in turns[start:] for msg in turn]
         return [system, *history]
 
 

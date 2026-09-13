@@ -129,8 +129,22 @@ class Settings(BaseSettings):
     # Tools are off because a small model does not produce usable tool calls and
     # their definitions alone dominate the prompt: 61 of them cost about 10k
     # tokens before the conversation starts.
-    local_max_tokens: int = 6000
+    local_max_tokens: int = 3000
     local_tools: bool = False
+    # The profile's own system prompt, replaced for locally served models.
+    #
+    # Cold prefill on this box with qwen3.5:4b, measured with a deliberately
+    # cache-missing prefix: 1,236 tokens took 37.8s, 3,036 took 97.3s and 6,036
+    # took 318.4s — 34 tokens per second degrading to 19 as the context grows.
+    # Cloudflare abandons a request at 125s, so the prompt is the wall here and
+    # the answer's length is not: prefill must finish before a single byte
+    # exists, which is also why streaming would not rescue this.
+    #
+    # The lead's own prompt is 2,419 tokens, about 75 of those 125 seconds spent
+    # before the conversation is even read. Hence a short one: every token saved
+    # is a thirtieth of a second back, and this is the only lever that moves
+    # without an Enterprise plan or a DNS-only subdomain bypassing the proxy.
+    local_system_prompt: str = ""
 
     # --- Telegram ----------------------------------------------------------
     telegram_bot_token: str = ""

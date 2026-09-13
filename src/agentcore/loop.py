@@ -159,16 +159,19 @@ class AgentLoop:
         # What the agent knows about the person it is talking to, supplied by the
         # caller rather than baked into the profile: the profile is a file in git
         # and these facts are rows in a database that changes between turns.
+        # A locally served model gets a different deal: a shorter system prompt,
+        # no tool catalogue and a much smaller transcript. See
+        # Settings.local_system_prompt for the measurements — the short version
+        # is that on this box the prompt is the wall, not the answer.
+        local = self._settings.is_local_model(model)
+
         system_prompt = self._profile.system_prompt
+        if local and self._settings.local_system_prompt:
+            system_prompt = self._settings.local_system_prompt
+            logger.info("model %s is served locally: using the short prompt", model)
         if extra_system:
             system_prompt = system_prompt + "\n\n" + extra_system
 
-        # A locally served model gets a different deal: no tool catalogue and a
-        # much smaller transcript. See Settings.local_max_tokens for the
-        # measurements — the short version is that 61 tool definitions plus a
-        # 30k transcript is a request the tunnel in front of Ollama times out on,
-        # and a 0.8B model answers by inventing work it never did.
-        local = self._settings.is_local_model(model)
         if local and not self._settings.local_tools:
             catalog = ToolCatalog(specs=[], _by_openai_name={}, skipped=[])
             logger.info("model %s is served locally: tools withheld", model)

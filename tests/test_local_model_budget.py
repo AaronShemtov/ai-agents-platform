@@ -200,3 +200,50 @@ def test_the_most_recent_turn_survives_even_a_tiny_budget():
     messages = llm.calls[0]["messages"]
     assert messages[0]["role"] == "system"
     assert messages[-1]["content"] == "привет"
+
+
+# -- the system prompt is the wall -------------------------------------------
+
+
+SHORT = "Ты помощник по инфраструктуре. Отвечай коротко и по делу."
+
+
+def test_a_local_model_gets_the_short_prompt():
+    """2,419 tokens of GitOps instructions is ~75s of the 125s Cloudflare allows."""
+    loop, llm, _ = build(
+        Settings(models_ollama=LOCAL, ollama_base_url="http://box/v1/",
+                 local_system_prompt=SHORT, max_billable_tokens_per_turn=500_000)
+    )
+    run(loop, LOCAL)
+    assert llm.calls[0]["messages"][0]["content"] == SHORT
+
+
+def test_a_hosted_model_keeps_the_profile_prompt():
+    loop, llm, _ = build(
+        Settings(models_ollama=LOCAL, ollama_base_url="http://box/v1/",
+                 local_system_prompt=SHORT, max_billable_tokens_per_turn=500_000)
+    )
+    run(loop, HOSTED)
+    assert llm.calls[0]["messages"][0]["content"] == "system"
+
+
+def test_without_a_short_prompt_configured_the_profile_one_is_used():
+    """Unset means "no opinion", not "send nothing"."""
+    loop, llm, _ = build()
+    run(loop, LOCAL)
+    assert llm.calls[0]["messages"][0]["content"] == "system"
+
+
+def test_the_facts_block_still_reaches_a_local_model():
+    """Shortening the instructions must not drop what is known about the user."""
+    loop, llm, _ = build(
+        Settings(models_ollama=LOCAL, ollama_base_url="http://box/v1/",
+                 local_system_prompt=SHORT, max_billable_tokens_per_turn=500_000)
+    )
+    asyncio.run(
+        loop.run(chat=ChatMemory(chat_id=1), user_text="привет", model=LOCAL,
+                 audit=FakeAudit(), extra_system="Он деплоит только через CI.")
+    )
+    system = llm.calls[0]["messages"][0]["content"]
+    assert SHORT in system
+    assert "только через CI" in system

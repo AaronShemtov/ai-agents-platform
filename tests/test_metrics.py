@@ -188,6 +188,21 @@ def test_nothing_anyone_said_is_in_the_payload() -> None:
     assert "chat_id" not in body
 
 
+def test_no_metric_is_labelled_by_chat_or_topic() -> None:
+    """One series per chat, and worse per topic, would grow without bound; who said
+    what belongs in the audit log. The record functions take neither today, which is
+    the point: a label added later fails here."""
+    metrics.record_tool_call(agent="x2", tool="github__get_file_contents",
+                             decision="allow", ok=True, duration_ms=10)
+    labels = {
+        label
+        for family in REGISTRY.collect()
+        for sample in family.samples
+        for label in sample.labels
+    }
+    assert not labels & {"chat_id", "thread_id", "chat", "topic"}
+
+
 def test_render_returns_something_prometheus_will_accept() -> None:
     payload, content_type = metrics.render()
     assert "text/plain" in content_type

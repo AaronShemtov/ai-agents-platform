@@ -1,0 +1,41 @@
+-- Telling topics apart: conversations gets thread_id.
+--
+-- For a database built from the schema.sql that predates this change. A fresh build
+-- already has the column and must not run this file (ORA-01430, column exists).
+--
+-- Run as AGENTS. Send each statement as its own request to /ords/agents/_/sql, with
+-- no binds: DDL is not valid bare inside a begin ... end block, and it commits by
+-- itself. Read the whole item in the response, not the HTTP status: a failed
+-- statement still answers 200, with `errorMessage` (a plain statement) or
+-- `errorDetails` (a PL/SQL block).
+--
+-- The order is the reverse of what a deploy does on its own, and it matters:
+--
+--   1. this file, then 2. the new image, then 3. the other file of this migration
+--   (2026-10-11-conversations-thread-id-drop-old-index.sql), only once the new image
+--   has been seen reading and writing.
+--
+-- The old code keeps working on the new column: it inserts without thread_id, which
+-- defaults to 0, and reads by agent and chat only. The new code on a table without
+-- the column answers normally and then reads nothing and stores nothing, one warning
+-- at a time; it says so once, at startup (AdbStore.check_schema). A pod that met the
+-- table before this file ran stays that way after it does: delete the pod (not a
+-- rollout restart; Flux undoes that).
+--
+-- Rolling back the schema is not needed: the extra column and index do the old code
+-- no harm, and the DEFAULT must stay, since it is what lets that code insert. Rolling
+-- back the code is not free: once the new image has written rows under topics, the
+-- old image reads every topic of a chat as one pile again, and its /new deletes all
+-- of them.
+--
+-- The rows that exist now keep thread_id = 0 on purpose. In the private chat that is
+-- simply its history. In the forum group it is every topic's messages mixed, which is
+-- what the group had: they are replayed as the General topic's, and the General
+-- topic's /new deletes them. Nothing records which topic an old message came from, so
+-- none could be moved, and by decision none was moved or deleted.
+
+-- 1. The column. A metadata change: existing rows read the default, none is rewritten.
+alter table conversations add (thread_id number default 0 not null);
+
+-- 2. The index the new queries use, with thread_id between the chat and id.
+create index conversations_by_thread on conversations (agent, chat_id, thread_id, id);

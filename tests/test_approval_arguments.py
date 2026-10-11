@@ -19,18 +19,21 @@ class FakeBot:
     def __init__(self):
         self.messages: list[dict] = []
 
-    async def send_message(self, chat_id, text, parse_mode=None, reply_markup=None):
+    async def send_message(
+        self, chat_id, text, parse_mode=None, reply_markup=None, **extra
+    ):
         self.messages.append(
             {
                 "chat_id": chat_id,
                 "text": text,
                 "parse_mode": parse_mode,
                 "reply_markup": reply_markup,
+                **extra,
             }
         )
 
 
-def _ask(arguments, *, tool="coder__ask", reason="причина"):
+def _ask(arguments, *, tool="coder__ask", reason="причина", **extra):
     bot = FakeBot()
     keyboard = object()
     asyncio.run(
@@ -43,6 +46,7 @@ def _ask(arguments, *, tool="coder__ask", reason="причина"):
             arguments=arguments,
             reason=reason,
             keyboard=keyboard,
+            **extra,
         )
     )
     return bot, keyboard
@@ -124,3 +128,23 @@ def test_every_chunk_stays_inside_the_telegram_limit():
     task = "\n".join(f"строка-{i} с довольно длинным хвостом текста" for i in range(900))
     bot, _ = _ask({"task": task})
     assert all(len(m["text"]) <= MAX_MESSAGE for m in bot.messages)
+
+
+# -- topics ------------------------------------------------------------------
+
+
+def test_every_chunk_goes_to_the_topic_the_request_came_from():
+    task = chr(10).join(f"строка-{i}" for i in range(600))
+    bot, _ = _ask({"task": task}, thread_id=7)
+    assert len(bot.messages) > 1
+    assert [m["message_thread_id"] for m in bot.messages] == [7] * len(bot.messages)
+
+
+def test_no_topic_sends_no_thread_at_all():
+    """0 means "no topic" in this code. Passed on, Telegram would answer 400
+    "message thread not found" and no approval could ever be asked in the private
+    chat or in General."""
+    bot, _ = _ask({"task": "почини кнопку"})
+    assert "message_thread_id" not in bot.messages[0]
+    bot, _ = _ask({"task": "почини кнопку"}, thread_id=0)
+    assert "message_thread_id" not in bot.messages[0]

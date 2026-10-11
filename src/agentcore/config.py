@@ -196,8 +196,9 @@ class Settings(BaseSettings):
     adb_username: str = "AGENTS"
     adb_password: str = ""
     adb_timeout_seconds: float = 10.0
-    # Messages replayed into a chat after a restart. Trimming by tokens happens
-    # afterwards, so this only bounds how much is read, not what is sent.
+    # Messages replayed into a conversation (a chat, or a topic of one) after a
+    # restart. Trimming by tokens happens afterwards, so this only bounds how much is
+    # read, not what is sent.
     memory_history_messages: int = 40
 
     # --- limits ------------------------------------------------------------

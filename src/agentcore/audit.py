@@ -128,9 +128,14 @@ def _digest(arguments: dict[str, Any]) -> str:
 
 
 class AuditLog:
-    def __init__(self, *, agent: str, chat_id: int | str) -> None:
+    def __init__(self, *, agent: str, chat_id: int | str, thread_id: int = 0) -> None:
         self._agent = agent
-        self._log = structlog.get_logger(_AUDIT).bind(agent=agent, chat_id=str(chat_id))
+        # `thread_id` beside `chat_id`, not folded into it: anything filtering the audit
+        # log by chat keeps working, and 0 is "no topic". Never a metric label: one
+        # series per topic would grow without bound.
+        self._log = structlog.get_logger(_AUDIT).bind(
+            agent=agent, chat_id=str(chat_id), thread_id=str(thread_id)
+        )
 
     @property
     def agent(self) -> str:

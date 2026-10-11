@@ -40,6 +40,8 @@ jobs:
         # after the image is already running in the cluster.
         run: |
           python -c "import agentcore.__main__"
+          python -c "import agentcore.preflight"
+          python -c "import mcp_agent.__main__"
           python -c "import mcp_cluster.__main__"
           python -c "import mcp_cloudflare.__main__"
 

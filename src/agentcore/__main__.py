@@ -93,8 +93,10 @@ async def amain() -> int:
     # Durable memory, if it is configured. Constructed rather than connected:
     # there is no I/O here, so an unreachable database shows up as a warning on
     # the first turn instead of a pod that will not start. An agent that forgets
-    # is worth more than one that refuses to run.
+    # is worth more than one that refuses to run. The one exception is the schema
+    # check below, which runs in the background and cannot stop anything.
     store = None
+    background_tasks: set[asyncio.Task[bool]] = set()
     if settings.memory_enabled():
         store = AdbStore(
             base_url=settings.adb_sql_url,
@@ -103,6 +105,13 @@ async def amain() -> int:
             timeout_seconds=settings.adb_timeout_seconds,
         )
         logger.info("durable memory enabled as %s", settings.adb_username)
+        # Whether the table has the columns this version writes. In the background and
+        # never fatal: a database that is slow or down must not hold up polling, and
+        # check_schema logs the reason itself. Kept in a set because the event loop
+        # holds tasks weakly, and one nobody references can be collected mid-run.
+        probe = asyncio.create_task(store.check_schema())
+        background_tasks.add(probe)
+        probe.add_done_callback(background_tasks.discard)
     else:
         logger.warning(
             "durable memory is not configured; history will be lost on restart"

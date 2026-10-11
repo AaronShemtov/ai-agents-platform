@@ -29,6 +29,19 @@ holds the URL shortener's data, and an agent with the ADMIN password could
 delete it by mistake. Confirmed by trying: ``select from admin.urls`` as this
 user is ORA-00942, table does not exist.
 
+Which conversation
+------------------
+A row belongs to an agent, a chat and a topic (`thread_id`: the forum topic of the
+chat, 0 for none). Without the topic every topic of a forum group replayed one shared
+history, and the agent answered each of them with the others mixed in. `thread_id` is
+a required keyword on everything that reads or deletes history, so a call site that
+forgot it is a TypeError rather than a silent read or delete of the whole chat.
+Rows from before the column existed carry the default, 0, and were deliberately left
+there. In the private chat that is simply its history. In a forum group it is every
+topic's messages mixed together, which is what the group had: they are replayed as
+the General topic's, and the General topic's /new deletes them. Nothing records which
+topic an old message came from, so nothing could have sorted them.
+
 No vectors yet
 --------------
 Deliberately. Facts number in the dozens and go into the prompt whole, so there
@@ -60,6 +73,14 @@ MAX_CONTENT_CHARS = 200_000
 
 class StoreUnavailable(RuntimeError):
     """The database could not be reached or refused the statement."""
+
+
+class StoreSqlError(StoreUnavailable):
+    """The database answered, and the statement failed: a missing column, a constraint.
+
+    Apart from the transport failures so that a caller can tell a database that is
+    down, which comes back by itself, from a schema that is wrong, which does not.
+    """
 
 
 def _bind(name: str, value: Any) -> dict[str, Any]:
@@ -197,8 +218,16 @@ class AdbStore:
         items = response.json().get("items") or []
         rows: list[dict] = []
         for item in items:
-            if item.get("errorMessage"):
-                raise StoreUnavailable(f"SQL error: {item['errorMessage'][:300]}")
+            # Two shapes, checked against the live instance. A plain statement that
+            # fails (a select from a missing table) carries `errorMessage`. A PL/SQL
+            # block that raises (every write here is one: `begin insert ...; commit;
+            # end;`) carries only `errorDetails`. Looking for the first alone let a
+            # failed insert, delete or merge come back as an empty result: /new
+            # reported the database cleared when it was not, and remember() confirmed
+            # a fact it had not stored.
+            error = item.get("errorMessage") or item.get("errorDetails")
+            if error:
+                raise StoreSqlError(f"SQL error: {str(error)[:300]}")
             result_set = item.get("resultSet")
             if result_set:
                 rows.extend(result_set.get("items") or [])
@@ -212,9 +241,46 @@ class AdbStore:
             log.warning("memory store unreachable: %s", exc)
             return False
 
+    async def check_schema(self) -> bool:
+        """Whether `conversations` has the columns this version writes.
+
+        Asked once at startup and logged loudly rather than raised: a pod that will
+        not start is worse than an agent that forgets, but an agent that forgets
+        without a word is what the first line of this module exists to prevent.
+        Without this, code that meets a table without `thread_id` answers every
+        message normally, reads no history and stores nothing, each failure a single
+        warning among the others.
+        """
+        try:
+            await self._run("select thread_id from conversations where 1 = 0")
+        except StoreSqlError as exc:
+            # The database answered and refused: the column is not there. This is the
+            # one case that sends the reader to the migration.
+            log.error(
+                "memory is not usable: the conversations table does not answer a "
+                "query for thread_id (%s). Apply sql/migrations/ before this version "
+                "runs; until then no history is read or stored.",
+                exc,
+            )
+            return False
+        except StoreUnavailable as exc:
+            # Down, slow or refusing the login: says nothing about the schema, and
+            # the first message after it recovers will find out for itself.
+            log.warning("could not check the memory schema: %s", exc)
+            return False
+        except Exception:
+            # Runs as a task nobody awaits; an exception escaping it would only
+            # surface as "Task exception was never retrieved" at garbage collection.
+            log.exception("could not check the memory schema")
+            return False
+        log.info("memory schema ok: conversations has thread_id")
+        return True
+
     # -- conversation history ----------------------------------------------
 
-    async def append(self, *, agent: str, chat_id: int, message: dict[str, Any]) -> None:
+    async def append(
+        self, *, agent: str, chat_id: int, thread_id: int, message: dict[str, Any]
+    ) -> None:
         """Store one message. Best effort: a failure must not lose the answer
         the user is waiting for, so it is logged rather than raised."""
         content = message.get("content")
@@ -227,8 +293,9 @@ class AdbStore:
         tool_calls = message.get("tool_calls")
         statement = (
             "begin insert into conversations "
-            "(agent, chat_id, role, content, tool_calls, tool_call_id) "
-            "values (:agent, :chat_id, :role, :content, :tool_calls, :tool_call_id); "
+            "(agent, chat_id, thread_id, role, content, tool_calls, tool_call_id) "
+            "values (:agent, :chat_id, :thread_id, :role, :content, :tool_calls, "
+            ":tool_call_id); "
             "commit; end;"
         )
         try:
@@ -237,6 +304,7 @@ class AdbStore:
                 {
                     "agent": agent,
                     "chat_id": chat_id,
+                    "thread_id": thread_id,
                     "role": message.get("role", "user"),
                     "content": content,
                     "tool_calls": (
@@ -248,8 +316,10 @@ class AdbStore:
         except StoreUnavailable as exc:
             log.warning("could not store a message: %s", exc)
 
-    async def history(self, *, agent: str, chat_id: int, limit: int) -> list[dict[str, Any]]:
-        """The most recent `limit` messages, oldest first.
+    async def history(
+        self, *, agent: str, chat_id: int, thread_id: int, limit: int
+    ) -> list[dict[str, Any]]:
+        """The most recent `limit` messages of one conversation, oldest first.
 
         Ordered newest-first in SQL and reversed here: `fetch first N` has to
         take the newest rows, but the transcript has to be replayed in the order
@@ -257,12 +327,13 @@ class AdbStore:
         """
         statement = (
             "select role, content, tool_calls, tool_call_id from conversations "
-            "where agent = :agent and chat_id = :chat_id "
+            "where agent = :agent and chat_id = :chat_id and thread_id = :thread_id "
             "order by id desc fetch first :lim rows only"
         )
         try:
             rows = await self._run(
-                statement, {"agent": agent, "chat_id": chat_id, "lim": limit}
+                statement,
+                {"agent": agent, "chat_id": chat_id, "thread_id": thread_id, "lim": limit},
             )
         except StoreUnavailable as exc:
             log.warning("could not read history, starting empty: %s", exc)
@@ -289,16 +360,29 @@ class AdbStore:
             messages.append(message)
         return replayable(messages)
 
-    async def clear(self, *, agent: str, chat_id: int) -> None:
-        """Forget one conversation — what /new means once history is durable."""
+    async def clear(self, *, agent: str, chat_id: int, thread_id: int) -> bool:
+        """Forget one conversation — what /new means once history is durable.
+
+        Returns whether the rows are gone, so that /new can say so only when it is
+        true: the next restart replays whatever a failed delete left behind.
+
+        One topic, not the chat: /new typed in a topic must not reach into the
+        others. In the General topic, or a chat without topics, that is thread 0 —
+        which is also where everything stored before topics were told apart sits.
+        """
         statement = (
             "begin delete from conversations "
-            "where agent = :agent and chat_id = :chat_id; commit; end;"
+            "where agent = :agent and chat_id = :chat_id and thread_id = :thread_id; "
+            "commit; end;"
         )
         try:
-            await self._run(statement, {"agent": agent, "chat_id": chat_id})
+            await self._run(
+                statement, {"agent": agent, "chat_id": chat_id, "thread_id": thread_id}
+            )
         except StoreUnavailable as exc:
             log.warning("could not clear history: %s", exc)
+            return False
+        return True
 
     # -- facts about the user ----------------------------------------------
 

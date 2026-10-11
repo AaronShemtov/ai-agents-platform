@@ -34,7 +34,7 @@ from agentcore.config import Settings, get_settings
 from agentcore.llm.router import build_llm
 from agentcore.mcp.client import MCPPool
 from agentcore.mcp.toolset import build_catalog
-from agentcore.memory import ChatMemory
+from agentcore.memory import ChatMemory, ConversationKey
 from agentcore.profiles import load_profile
 from agentcore.store import AdbStore
 
@@ -51,14 +51,21 @@ class Check:
         return f"  {self.name:<16} {self.status:<5} {self.detail}"
 
 
-async def _busiest_chat(store: AdbStore, agent: str) -> int | None:
-    """The conversation most likely to expose a replay problem: the longest one."""
+async def _busiest_conversation(store: AdbStore, agent: str) -> ConversationKey | None:
+    """The conversation most likely to expose a replay problem: the longest one.
+
+    A conversation is a chat and a topic of it; counting by chat alone would pick
+    the whole group and replay a window no topic ever sees.
+    """
     rows = await store._run(
-        "select chat_id, count(*) as n from conversations "
-        "where agent = :agent group by chat_id order by n desc fetch first 1 rows only",
+        "select chat_id, thread_id, count(*) as n from conversations "
+        "where agent = :agent group by chat_id, thread_id order by n desc "
+        "fetch first 1 rows only",
         {"agent": agent},
     )
-    return int(rows[0]["chat_id"]) if rows else None
+    if not rows:
+        return None
+    return ConversationKey(int(rows[0]["chat_id"]), int(rows[0]["thread_id"]))
 
 
 async def check_history(settings: Settings, model: str, profile) -> Check:
@@ -72,14 +79,17 @@ async def check_history(settings: Settings, model: str, profile) -> Check:
         password=settings.adb_password,
         timeout_seconds=settings.adb_timeout_seconds,
     )
-    chat_id = await _busiest_chat(store, profile.id)
-    if chat_id is None:
+    busiest = await _busiest_conversation(store, profile.id)
+    if busiest is None:
         return Check("history replay", SKIP, "nothing stored yet")
 
-    chat = ChatMemory(chat_id=chat_id)
+    chat = ChatMemory(chat_id=busiest.chat_id, thread_id=busiest.thread_id)
     chat.adopt(
         await store.history(
-            agent=profile.id, chat_id=chat_id, limit=settings.memory_history_messages
+            agent=profile.id,
+            chat_id=busiest.chat_id,
+            thread_id=busiest.thread_id,
+            limit=settings.memory_history_messages,
         )
     )
     restored = len(chat.messages)
@@ -106,7 +116,8 @@ async def check_history(settings: Settings, model: str, profile) -> Check:
     return Check(
         "history replay",
         PASS,
-        f"chat {chat_id}, {restored} restored, {len(messages)} sent, "
+        f"chat {busiest.chat_id} topic {busiest.thread_id}, {restored} restored, "
+        f"{len(messages)} sent, "
         f"{time.monotonic() - started:.1f}s",
     )
 

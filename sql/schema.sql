@@ -18,8 +18,9 @@
 --     /ords/agents/_/sql endpoint the application talks to. Note the path is
 --     the schema's own mapping, not ADMIN's.
 
--- Conversation history. One row per message; replayed into a chat on the first
--- message after a restart, newest MEMORY_HISTORY_MESSAGES rows.
+-- Conversation history. One row per message; replayed into a conversation on the
+-- first message after a restart, newest MEMORY_HISTORY_MESSAGES rows. A conversation
+-- is a chat and, inside a forum group, one of its topics.
 create table conversations (
   id            number generated always as identity,
   agent         varchar2(64)   not null,
@@ -31,12 +32,20 @@ create table conversations (
   tool_calls    clob,
   tool_call_id  varchar2(128),
   created_at    timestamp with time zone default systimestamp not null,
+  -- The forum topic of chat_id; 0 means no topic: a private chat, an ordinary group
+  -- or the General topic of a forum, and every row written before topics were told
+  -- apart. Last in the table because the live one got it by ALTER (see
+  -- migrations/). The DEFAULT is load-bearing, not a convenience: it is what lets
+  -- code that predates the column keep inserting, so rolling back needs nothing
+  -- here. Do not drop it.
+  thread_id     number default 0 not null,
   constraint conversations_pk primary key (id)
 );
 
--- The read is always "the newest N for this agent and chat", so the index
--- carries id as its third column and the query is answered from it alone.
-create index conversations_by_chat on conversations (agent, chat_id, id);
+-- The read is always "the newest N for this agent, chat and topic", so the index
+-- carries id as its fourth column: it answers the filter and the order, and the rows
+-- themselves come from the table.
+create index conversations_by_thread on conversations (agent, chat_id, thread_id, id);
 
 -- Facts about the user. Small and read whole into the system prompt, so there is
 -- nothing to search and no vector column — see the commit that added this.

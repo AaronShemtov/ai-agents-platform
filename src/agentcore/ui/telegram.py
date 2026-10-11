@@ -41,7 +41,7 @@ from telegram.ext import (
 from agentcore.audit import AuditLog
 from agentcore.config import Settings
 from agentcore.loop import AgentLoop
-from agentcore.memory import ChatMemory, MemoryStore
+from agentcore.memory import ChatMemory, ConversationKey, MemoryStore
 from agentcore.profiles import AgentProfile
 from agentcore.store import AdbStore
 from agentcore.ui import tgmd
@@ -52,6 +52,52 @@ logger = logging.getLogger(__name__)
 MAX_MESSAGE = 3800
 EDIT_INTERVAL = 1.2  # seconds between progress edits
 APPROVAL_TIMEOUT = 600.0  # seconds to wait for a button press
+
+# Telegram's id for the General topic of a forum. It is never a topic in an incoming
+# message and sending to it is refused ("message thread not found"), so seeing it
+# means "no topic".
+GENERAL_TOPIC_ID = 1
+
+# Appended to the system prompt inside a topic, after the facts. The model otherwise
+# has no way to know the topic is one of several, and an empty history in a new topic
+# reads as "we have not talked", which invites a guess about what was said elsewhere.
+TOPIC_NOTE = (
+    "Этот разговор идёт в отдельной теме группы. Других тем ты не видишь и не "
+    "помнишь: если человек ссылается на то, что обсуждали в другой теме, скажи, что "
+    "её не видишь, и уточни, что нужно. Факты выше общие для всех тем; если разговор "
+    "в этой теме им противоречит, верь разговору."
+)
+
+
+def thread_of(message: Any) -> int:
+    """The forum topic a message was written in, or 0 when it was written in none.
+
+    `message_thread_id` alone is not the answer. Telegram also sets it on a chain of
+    replies in an ordinary group, to the id of the first message in the chain, and
+    there it names no topic: only `is_topic_message` says it does. python-telegram-bot's
+    own `reply_text` applies the same test before it routes an answer into a thread.
+    The General topic of a forum arrives with neither, so it is 0 like a private chat
+    and an ordinary group, and everything stored before topics were told apart.
+    """
+    if message is None or not getattr(message, "is_topic_message", None):
+        return 0
+    thread = int(getattr(message, "message_thread_id", None) or 0)
+    return thread if thread > GENERAL_TOPIC_ID else 0
+
+
+def _is_general(update: Update, thread_id: int) -> bool:
+    """The General topic of a forum: no topic id, in a chat that has topics."""
+    return not thread_id and bool(getattr(update.effective_chat, "is_forum", None))
+
+
+def _scope(update: Update, thread_id: int) -> str:
+    """What to call this conversation in a reply, so /new does not sound like more
+    than it did."""
+    if thread_id:
+        return "этой темы"
+    if _is_general(update, thread_id):
+        return "темы General"
+    return "этого чата"
 
 
 class ProgressReporter:
@@ -119,7 +165,7 @@ class TelegramUI:
     # -- durable memory ------------------------------------------------------
 
     async def _hydrate(self, chat: ChatMemory) -> None:
-        """Load a chat's history from the database, once per process.
+        """Load a conversation's history from the database, once per process.
 
         `hydrated` is set before the read, not after, so a database that is down
         costs one attempt rather than one per message. Losing history is bad;
@@ -131,12 +177,16 @@ class TelegramUI:
         history = await self._store.history(
             agent=self._profile.id,
             chat_id=chat.chat_id,
+            thread_id=chat.thread_id,
             limit=self._s.memory_history_messages,
         )
         if history:
             chat.adopt(history)
             logger.info(
-                "restored %d messages for chat %s", len(history), chat.chat_id
+                "restored %d messages for chat %s topic %s",
+                len(history),
+                chat.chat_id,
+                chat.thread_id,
             )
 
     async def _persist(self, chat: ChatMemory) -> None:
@@ -150,7 +200,10 @@ class TelegramUI:
             return
         for message in chat.unpersisted():
             await self._store.append(
-                agent=self._profile.id, chat_id=chat.chat_id, message=message
+                agent=self._profile.id,
+                chat_id=chat.chat_id,
+                thread_id=chat.thread_id,
+                message=message,
             )
         chat.mark_persisted()
 
@@ -189,6 +242,21 @@ class TelegramUI:
             f"{lines}\n\n" + keeping
         )
 
+    async def _extra_system(self, thread_id: int) -> str:
+        """What goes after the profile's prompt: the facts, then in a topic the note
+        that it is one of several. The history of the topic follows in the transcript,
+        so the order the model reads is the facts, then this topic."""
+        parts = [await self._facts_prompt()]
+        if thread_id:
+            parts.append(TOPIC_NOTE)
+        return "\n\n".join(part for part in parts if part)
+
+    @staticmethod
+    def _key(update: Update) -> ConversationKey:
+        """The conversation an update belongs to. The only place the key is built, so
+        the rule for what counts as a topic is written once."""
+        return ConversationKey(update.effective_chat.id, thread_of(update.effective_message))
+
     # -- authorisation -------------------------------------------------------
 
     def _authorised(self, update: Update) -> bool:
@@ -223,7 +291,7 @@ class TelegramUI:
             return await self._refuse(update)
         await update.effective_message.reply_text(
             "<b>Команды</b>\n"
-            "/new — забыть контекст разговора\n"
+            "/new — забыть контекст этой темы (в чате без тем — всего чата)\n"
             "/memories — что я помню о тебе\n"
             "/forget &lt;ключ&gt; — удалить один факт о тебе\n"
             "/model &lt;имя&gt; — сменить модель для этого чата\n"
@@ -237,15 +305,34 @@ class TelegramUI:
     async def cmd_new(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorised(update):
             return await self._refuse(update)
-        chat_id = update.effective_chat.id
-        self._memory.reset(chat_id)
+        key = self._key(update)
+        scope = _scope(update, key.thread_id)
+        self._memory.reset(key)
+        stored = True
         if self._store is not None:
             # Otherwise the next message would restore everything /new was
             # meant to get rid of.
-            await self._store.clear(agent=self._profile.id, chat_id=chat_id)
+            stored = await self._store.clear(
+                agent=self._profile.id, chat_id=key.chat_id, thread_id=key.thread_id
+            )
+        if not stored:
+            # Said, not hidden: the rows are still there and the next restart
+            # replays them, which is the opposite of what was asked.
+            await update.effective_message.reply_text(
+                f"Контекст {scope} очищен в памяти, но удалить его из базы не вышло: "
+                "после перезапуска он вернётся. Причина — в логе агента."
+            )
+            return
+        # The General topic holds everything written before topics were told apart, so
+        # clearing it clears all of that, not only what was said in General.
+        before = (
+            "Это и вся история, записанная до разделения по темам. "
+            if _is_general(update, key.thread_id)
+            else ""
+        )
         await update.effective_message.reply_text(
-            "Контекст очищен — и в памяти, и в базе. Факты о тебе не тронуты, "
-            "их показывает /memories."
+            f"Контекст {scope} очищен — и в памяти, и в базе. {before}"
+            "Факты о тебе не тронуты, их показывает /memories."
         )
 
     async def cmd_memories(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -320,8 +407,11 @@ class TelegramUI:
     async def cmd_models(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorised(update):
             return await self._refuse(update)
-        chat = self._memory.get(update.effective_chat.id)
-        current = chat.model or self._profile.model or self._s.model_default
+        current = (
+            self._memory.model_for(update.effective_chat.id)
+            or self._profile.model
+            or self._s.model_default
+        )
         lines = [
             ("• <b>" + html.escape(m) + "</b>" if m == current else "• " + html.escape(m))
             for m in self._s.allowed_models()
@@ -347,7 +437,7 @@ class TelegramUI:
                 parse_mode=ParseMode.HTML,
             )
             return
-        self._memory.get(update.effective_chat.id).model = requested
+        self._memory.set_model(update.effective_chat.id, requested)
         await update.effective_message.reply_text(f"Модель для этого чата: {requested}")
 
     async def cmd_tools(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
@@ -376,8 +466,26 @@ class TelegramUI:
     async def cmd_status(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorised(update):
             return await self._refuse(update)
-        chat = self._memory.get(update.effective_chat.id)
-        model = chat.model or self._profile.model or self._s.model_default
+        key = self._key(update)
+        chat = self._memory.get(key)
+        if chat.hydrated or self._store is None:
+            count = len(chat.messages)
+        else:
+            # Not loaded yet, as right after a restart. Say what the next message will
+            # load rather than a zero that looks like lost memory, but do not load it
+            # here: a load started by a command races the turn that follows it, and
+            # the late result would replace a transcript that had already moved on.
+            count = len(
+                await self._store.history(
+                    agent=self._profile.id,
+                    chat_id=key.chat_id,
+                    thread_id=key.thread_id,
+                    limit=self._s.memory_history_messages,
+                )
+            )
+        model = (
+            self._memory.model_for(key.chat_id) or self._profile.model or self._s.model_default
+        )
         await update.effective_message.reply_text(
             f"Профиль: <b>{html.escape(self._profile.id)}</b>\n"
             f"Модель: <b>{html.escape(model)}</b>\n"
@@ -385,7 +493,8 @@ class TelegramUI:
             f"Cloudflare: <code>{self._s.cloudflare_write_mode.value}</code>\n"
             f"Защищённые репо: <code>{html.escape(self._s.protected_repos) or '—'}</code>\n"
             f"Лимит шагов: {self._loop.max_steps}\n"
-            f"Сообщений в контексте: {len(chat.messages)}",
+            f"Сообщений в контексте {_scope(update, key.thread_id)}: {count}"
+            + (f"\nТема: {key.thread_id}" if key.thread_id else ""),
             parse_mode=ParseMode.HTML,
         )
 
@@ -429,10 +538,13 @@ class TelegramUI:
         cancel = asyncio.Event()
         self._running[chat_id] = cancel
 
-        chat = self._memory.get(chat_id)
+        # The conversation is the topic, not the chat; the busy flag, /cancel and the
+        # model stay per chat, as they were.
+        key = self._key(update)
+        chat = self._memory.get(key)
         await self._hydrate(chat)
-        model = chat.model or self._profile.model or self._s.model_default
-        audit = AuditLog(agent=self._profile.id, chat_id=chat_id)
+        model = self._memory.model_for(chat_id) or self._profile.model or self._s.model_default
+        audit = AuditLog(agent=self._profile.id, chat_id=chat_id, thread_id=key.thread_id)
 
         try:
             result = await self._loop.run(
@@ -441,9 +553,9 @@ class TelegramUI:
                 model=model,
                 audit=audit,
                 progress=progress,
-                approver=self._make_approver(ctx, chat_id),
+                approver=self._make_approver(ctx, chat_id, key.thread_id),
                 cancel=cancel,
-                extra_system=await self._facts_prompt(),
+                extra_system=await self._extra_system(key.thread_id),
             )
             await progress.finish()
             await self._send_long(update, result.text or "(пустой ответ)")
@@ -467,7 +579,9 @@ class TelegramUI:
 
     # -- approvals -----------------------------------------------------------
 
-    def _make_approver(self, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int):
+    def _make_approver(
+        self, ctx: ContextTypes.DEFAULT_TYPE, chat_id: int, thread_id: int = 0
+    ):
         async def approver(tool: str, arguments: dict[str, Any], reason: str) -> bool:
             token = uuid.uuid4().hex[:8]
             future: asyncio.Future[bool] = asyncio.get_running_loop().create_future()
@@ -488,6 +602,7 @@ class TelegramUI:
                 arguments=arguments,
                 reason=reason,
                 keyboard=keyboard,
+                thread_id=thread_id,
             )
             try:
                 return await asyncio.wait_for(future, timeout=APPROVAL_TIMEOUT)
@@ -530,6 +645,7 @@ class TelegramUI:
         arguments: dict[str, Any],
         reason: str,
         keyboard: InlineKeyboardMarkup,
+        thread_id: int = 0,
     ) -> None:
         """Ask for approval, showing the arguments in full.
 
@@ -539,6 +655,10 @@ class TelegramUI:
         and an ellipsis. Approving an instruction you cannot read is not
         approving it, so the arguments now go out whole, across as many messages
         as they take, with the buttons on the last one.
+
+        The prompt goes to the topic the request came from. A bare `send_message` into
+        a forum lands in General, where nobody was looking, and the turn then waited
+        out APPROVAL_TIMEOUT for a button nobody saw.
         """
         head = (
             "<b>Подтверди действие</b>\n"
@@ -551,6 +671,9 @@ class TelegramUI:
         # along, so the per-chunk budget is deliberately well under the limit.
         budget = max(MAX_MESSAGE - len(head) - len(tail) - 200, 500)
         chunks = _split(_format_arguments(arguments), budget)
+        # Left out, never 0: 0 means "no topic" here, and a thread Telegram does not
+        # know is answered with 400 "message thread not found".
+        topic = {"message_thread_id": thread_id} if thread_id else {}
 
         for index, chunk in enumerate(chunks):
             last = index == len(chunks) - 1
@@ -565,6 +688,7 @@ class TelegramUI:
                 # Only the final message decides anything. Buttons on an earlier
                 # chunk would let someone approve a task they are still reading.
                 reply_markup=keyboard if last else None,
+                **topic,
             )
 
     async def _send_long(self, update: Update, text: str) -> None:

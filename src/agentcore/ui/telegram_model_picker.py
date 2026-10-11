@@ -23,8 +23,11 @@ class TelegramUI(BaseTelegramUI):
         if not self._authorised(update):
             return await self._refuse(update)
 
-        chat = self._memory.get(update.effective_chat.id)
-        current = chat.model or self._profile.model or self._s.model_default
+        current = (
+            self._memory.model_for(update.effective_chat.id)
+            or self._profile.model
+            or self._s.model_default
+        )
         allowed = self._s.allowed_models()
         keyboard = InlineKeyboardMarkup(
             [
@@ -66,7 +69,9 @@ class TelegramUI(BaseTelegramUI):
             await query.answer("Не удалось определить чат", show_alert=True)
             return
 
-        self._memory.get(chat.id).model = requested
+        # Per chat, like /model: the model is not part of a topic's memory, so this needs
+        # no topic, which a button pressed on an old keyboard may not be able to give.
+        self._memory.set_model(chat.id, requested)
         await query.answer(f"Выбрана {requested}")
         await query.edit_message_text(
             f"Модель для этого чата: <b>{html.escape(requested)}</b>",

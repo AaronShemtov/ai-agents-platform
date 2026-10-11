@@ -10,7 +10,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from agentcore.memory import ChatMemory, MemoryStore, estimate_tokens
+import pytest
+
+from agentcore.memory import ChatMemory, ConversationKey, MemoryStore, estimate_tokens
 
 
 def user(text: str) -> dict[str, Any]:
@@ -107,18 +109,68 @@ def test_estimate_tokens_counts_tool_calls_too() -> None:
 
 def test_store_isolates_chats_and_resets_one_at_a_time() -> None:
     store = MemoryStore()
-    store.get(1).append(user("a"))
-    store.get(2).append(user("b"))
-    store.reset(1)
-    assert store.get(1).messages == []
-    assert len(store.get(2).messages) == 1
+    store.get(ConversationKey(1, 0)).append(user("a"))
+    store.get(ConversationKey(2, 0)).append(user("b"))
+    store.reset(ConversationKey(1, 0))
+    assert store.get(ConversationKey(1, 0)).messages == []
+    assert len(store.get(ConversationKey(2, 0)).messages) == 1
+
+
+def test_the_topics_of_one_chat_are_separate_conversations() -> None:
+    """The reason the key has two parts: one forum group, one history per topic."""
+    store = MemoryStore()
+    store.get(ConversationKey(-100, 5)).append(user("about the database"))
+    store.get(ConversationKey(-100, 9)).append(user("about the interview"))
+    assert [m["content"] for m in store.get(ConversationKey(-100, 5)).messages] == [
+        "about the database"
+    ]
+    assert [m["content"] for m in store.get(ConversationKey(-100, 9)).messages] == [
+        "about the interview"
+    ]
+
+
+def test_resetting_one_topic_leaves_the_others() -> None:
+    store = MemoryStore()
+    store.get(ConversationKey(-100, 5)).append(user("a"))
+    store.get(ConversationKey(-100, 9)).append(user("b"))
+    store.get(ConversationKey(-100, 0)).append(user("general"))
+    store.reset(ConversationKey(-100, 5))
+    assert store.get(ConversationKey(-100, 5)).messages == []
+    assert len(store.get(ConversationKey(-100, 9)).messages) == 1
+    assert len(store.get(ConversationKey(-100, 0)).messages) == 1
+
+
+def test_a_conversation_knows_its_own_chat_and_topic() -> None:
+    chat = MemoryStore().get(ConversationKey(-100, 5))
+    assert (chat.chat_id, chat.thread_id) == (-100, 5)
+
+
+def test_a_bare_chat_id_is_refused_rather_than_becoming_a_conversation() -> None:
+    """The old way of calling this. Quietly accepting it would file the messages
+    under a topic-less guess, which is the mixing the key exists to stop."""
+    with pytest.raises(AttributeError):
+        MemoryStore().get(1)  # type: ignore[arg-type]
+
+
+def test_a_transcript_built_without_a_topic_is_topic_zero() -> None:
+    # The coder and the reviewer keep a throwaway transcript per call.
+    assert ChatMemory(chat_id=1).thread_id == 0
 
 
 def test_reset_keeps_the_model_override() -> None:
     # /new clears the conversation, not the model the user picked with /model.
     store = MemoryStore()
-    chat = store.get(1)
-    chat.model = "gpt-5-mini"
-    chat.append(user("a"))
-    store.reset(1)
-    assert chat.model == "gpt-5-mini"
+    store.set_model(1, "gpt-5-mini")
+    store.get(ConversationKey(1, 0)).append(user("a"))
+    store.reset(ConversationKey(1, 0))
+    assert store.model_for(1) == "gpt-5-mini"
+
+
+def test_the_model_is_picked_per_chat_and_shared_by_its_topics() -> None:
+    """/model has always applied to the whole chat; moving it into the topic would
+    have changed that without anyone asking."""
+    store = MemoryStore()
+    assert store.model_for(-100) is None
+    store.set_model(-100, "gpt-5-mini")
+    assert store.model_for(-100) == "gpt-5-mini"
+    assert store.model_for(-200) is None

@@ -1,4 +1,4 @@
-"""Per-chat conversation state.
+"""Per-conversation state: one chat, or one topic of a forum chat.
 
 In-memory for now. That means history is lost on restart, which for a single-replica
 Deployment with `strategy: Recreate` happens on every rollout. Accepted for phase 1;
@@ -14,7 +14,7 @@ so trimming works on whole turns: a `user` message and everything it triggered.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, NamedTuple
 
 # Rough characters-per-token. Only used to decide when to trim, so being off by 20%
 # costs a little context, not correctness.
@@ -40,10 +40,25 @@ def estimate_tokens(messages: list[dict[str, Any]]) -> int:
 TRIM_STEP = 4
 
 
+class ConversationKey(NamedTuple):
+    """Which conversation a message belongs to: a chat, and a topic inside it.
+
+    `thread_id` is the forum topic. 0 means "no topic": a private chat, an ordinary
+    group, or the General topic of a forum, which Telegram addresses by leaving the
+    thread out. Every row stored before topics were told apart is 0 too.
+
+    There is no default on `thread_id`, on purpose. A call site that forgot the topic
+    would land in 0 without anything failing, and 0 is the shared pile this key
+    exists to stop adding to.
+    """
+
+    chat_id: int
+    thread_id: int
+
+
 @dataclass
 class ChatMemory:
     chat_id: int
-    model: str | None = None  # per-chat override set by /model
     messages: list[dict[str, Any]] = field(default_factory=list)
 
     # How many of `messages` are already in the durable store. A turn writes
@@ -54,6 +69,12 @@ class ChatMemory:
     # even if the load failed — a database that is down must not be asked again
     # on every message, and an agent with no memory still answers.
     hydrated: bool = False
+
+    # The topic of `chat_id` this transcript belongs to; see ConversationKey. Keyword
+    # only and defaulted because most constructions have no topic to speak of (the
+    # coder and the reviewer keep a throwaway transcript per call), and MemoryStore,
+    # which builds the real ones, always passes it.
+    thread_id: int = field(default=0, kw_only=True)
 
     def append(self, message: dict[str, Any]) -> None:
         self.messages.append(message)
@@ -148,15 +169,30 @@ def _split_into_turns(messages: list[dict[str, Any]]) -> list[list[dict[str, Any
 
 
 class MemoryStore:
-    """Chat id -> ChatMemory."""
+    """Conversation -> ChatMemory, and chat -> the model picked with /model.
+
+    The transcript belongs to a conversation (a chat, or a topic of one), the model
+    to the chat: /model has always applied to the whole chat, and moving it to the
+    topic would have changed that without anyone asking.
+    """
 
     def __init__(self) -> None:
-        self._chats: dict[int, ChatMemory] = {}
+        self._chats: dict[ConversationKey, ChatMemory] = {}
+        self._models: dict[int, str] = {}
 
-    def get(self, chat_id: int) -> ChatMemory:
-        if chat_id not in self._chats:
-            self._chats[chat_id] = ChatMemory(chat_id=chat_id)
-        return self._chats[chat_id]
+    def get(self, key: ConversationKey) -> ChatMemory:
+        # `key.chat_id` rather than unpacking: a bare chat id, the old way of calling
+        # this, fails here instead of quietly becoming a conversation of its own.
+        if key not in self._chats:
+            self._chats[key] = ChatMemory(chat_id=key.chat_id, thread_id=key.thread_id)
+        return self._chats[key]
 
-    def reset(self, chat_id: int) -> None:
-        self.get(chat_id).reset()
+    def reset(self, key: ConversationKey) -> None:
+        """Forget one conversation. The model picked for its chat stays."""
+        self.get(key).reset()
+
+    def model_for(self, chat_id: int) -> str | None:
+        return self._models.get(chat_id)
+
+    def set_model(self, chat_id: int, model: str) -> None:
+        self._models[chat_id] = model

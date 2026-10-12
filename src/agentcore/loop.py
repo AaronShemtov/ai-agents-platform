@@ -285,6 +285,7 @@ class AgentLoop:
                     progress=progress,
                     approver=approver,
                     chat_id=chat.chat_id,
+                    thread_id=chat.thread_id,
                 )
                 if called:
                     tool_calls += 1
@@ -349,6 +350,7 @@ class AgentLoop:
         progress: ProgressFn,
         approver: ApproverFn,
         chat_id: int | None = None,
+        thread_id: int = 0,
     ) -> tuple[str, bool, int]:
         qualified = catalog.resolve(call.name)
         if qualified is None:
@@ -430,8 +432,15 @@ class AgentLoop:
 
         with Timer() as timer:
             if is_local(qualified):
+                # The conversation the turn is in: the reading tools read this agent's
+                # rows only and mark this conversation among the others.
                 result = await call_local(
-                    qualified, call.arguments, store=self._store, chat_id=chat_id
+                    qualified,
+                    call.arguments,
+                    store=self._store,
+                    agent=self._profile.id,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
                 )
             else:
                 result = await self._pool.call_tool(qualified, call.arguments)

@@ -17,10 +17,11 @@ from typing import Any
 import pytest
 from telegram import Update
 
+from agentcore import recall
 from agentcore.config import Settings
 from agentcore.loop import AgentLoop
 from agentcore.memory import MemoryStore
-from agentcore.store import AdbStore, Fact
+from agentcore.store import AdbStore, ConversationSummary, Fact, StoreUnavailable
 from agentcore.ui import TelegramUI
 from agentcore.ui import telegram as telegram_ui
 from agentcore.ui.telegram import TOPIC_NOTE, thread_of
@@ -58,6 +59,8 @@ class FakeStore:
         self.facts_known: list[Fact] = []
         self.clear_works = True
         self.gate: asyncio.Event | None = None  # holds every history read until set
+        self.touched: list[tuple[str, int, int]] = []  # conversations by last write
+        self.listing_error: Exception | None = None
 
     async def history(
         self, *, agent: str, chat_id: int, thread_id: int, limit: int
@@ -69,7 +72,11 @@ class FakeStore:
     async def append(
         self, *, agent: str, chat_id: int, thread_id: int, message: dict[str, Any]
     ) -> None:
-        self.rows.setdefault((agent, chat_id, thread_id), []).append(message)
+        key = (agent, chat_id, thread_id)
+        self.rows.setdefault(key, []).append(message)
+        if key in self.touched:
+            self.touched.remove(key)
+        self.touched.append(key)
 
     async def clear(self, *, agent: str, chat_id: int, thread_id: int) -> bool:
         if not self.clear_works:
@@ -79,6 +86,29 @@ class FakeStore:
 
     async def facts(self, *, scope: str | None = None) -> list[Fact]:
         return list(self.facts_known)
+
+    async def conversations(self, *, agent: str) -> list[ConversationSummary]:
+        """Newest first, as the real one orders them: the ones written to last, then
+        the rows a test put there directly."""
+        if self.listing_error is not None:
+            raise self.listing_error
+        keys = [key for key in reversed(self.touched) if key[0] == agent]
+        keys += [key for key in self.rows if key[0] == agent and key not in keys]
+        listing = []
+        for key in keys:
+            said = [m["content"] for m in self.rows[key] if m.get("role") == "user"]
+            listing.append(
+                ConversationSummary(
+                    chat_id=key[1],
+                    thread_id=key[2],
+                    messages=len(self.rows[key]),
+                    first_day="2026-10-11",
+                    last_at="2026-10-11 21:42",
+                    first_user=said[0] if said else "",
+                    last_user=said[-1] if said else "",
+                )
+            )
+        return listing
 
 
 class FakeLoop:
@@ -109,10 +139,17 @@ class FakeLoop:
         return SimpleNamespace(text=f"re: {user_text}")
 
 
-def make_ui(*, store: FakeStore | None = None, **settings: Any):
+def make_ui(*, store: FakeStore | None = None, recall_tools: bool = True, **settings: Any):
+    """`recall_tools=False` is a profile without memory__* in its allow list."""
     loop = FakeLoop()
     store = FakeStore() if store is None else store
-    profile = SimpleNamespace(id="lead", name="Lead", description="", model=None)
+    profile = SimpleNamespace(
+        id="lead",
+        name="Lead",
+        description="",
+        model=None,
+        tool_allowed=lambda name: recall_tools or not name.startswith("memory__"),
+    )
     ui = TelegramUI(
         settings=Settings(telegram_allowed_users="42", **settings),
         profile=profile,
@@ -379,13 +416,107 @@ async def test_the_model_is_picked_for_the_chat_and_every_topic_uses_it() -> Non
 # -- what the model is told ---------------------------------------------------
 
 
-async def test_a_topic_is_told_it_is_one_of_several_and_general_is_not() -> None:
+async def test_every_conversation_is_told_it_comes_first_and_the_others_can_be_read() -> None:
+    """A topic, General and the private chat alike: each is first priority for itself,
+    and every other one is second."""
     ui, loop, _ = make_ui()
+    bot = FakeBot()
+    await ui.on_message(make_update(bot, "a", thread=5, topic=True), ctx_for(bot))
+    await ui.on_message(make_update(bot, "b"), ctx_for(bot))
+    await ui.on_message(make_update(bot, "c", chat_id=PRIVATE), ctx_for(bot))
+    assert len(loop.runs) == 3
+    for run in loop.runs:
+        assert recall.RECALL_NOTE in run.extra_system
+        assert TOPIC_NOTE not in run.extra_system
+
+
+async def test_the_index_names_the_other_conversations_and_not_this_one() -> None:
+    store = FakeStore()
+    store.rows[("lead", GROUP, 9)] = [{"role": "user", "content": "про собеседование"}]
+    store.rows[("lead", GROUP, 0)] = [{"role": "user", "content": "старое"}]
+    store.rows[("lead", PRIVATE, 0)] = [{"role": "user", "content": "в личке"}]
+    store.rows[("coder", GROUP, 3)] = [{"role": "user", "content": "чужое"}]
+    ui, loop, _ = make_ui(store=store)
+    bot = FakeBot()
+    await ui.on_message(make_update(bot, "про базу", thread=5, topic=True), ctx_for(bot))
+    await ui.on_message(make_update(bot, "ещё", thread=5, topic=True), ctx_for(bot))
+
+    second = loop.runs[1].extra_system
+    assert "тема 9" in second
+    assert "про собеседование" in second
+    assert "General" in second
+    assert "личный чат" in second
+    assert "тема 5" not in second  # its own history is the transcript, not a line here
+    assert "тема 3" not in second  # another agent's conversations are not this agent's
+
+
+async def test_the_prompt_reads_facts_then_the_note_then_the_index() -> None:
+    """The note says the history below is this conversation's; after the index it
+    would stand between the other conversations and nothing."""
+    store = FakeStore()
+    store.facts_known = [Fact(key="k", fact="a durable fact", scope="user", updated_at="")]
+    store.rows[("lead", GROUP, 9)] = [{"role": "user", "content": "elsewhere"}]
+    ui, loop, _ = make_ui(store=store)
+    bot = FakeBot()
+    await ui.on_message(make_update(bot, "a", thread=5, topic=True), ctx_for(bot))
+    extra = loop.runs[0].extra_system
+    assert extra.index("a durable fact") < extra.index(recall.RECALL_NOTE) < extra.index("тема 9")
+
+
+async def test_without_the_tools_a_topic_is_told_it_sees_no_other_and_general_nothing() -> None:
+    """A profile that cannot read the other conversations must not be told it can."""
+    ui, loop, _ = make_ui(recall_tools=False)
     bot = FakeBot()
     await ui.on_message(make_update(bot, "a", thread=5, topic=True), ctx_for(bot))
     await ui.on_message(make_update(bot, "b"), ctx_for(bot))
     assert TOPIC_NOTE in loop.runs[0].extra_system
     assert TOPIC_NOTE not in loop.runs[1].extra_system
+    assert all(recall.RECALL_NOTE not in run.extra_system for run in loop.runs)
+
+
+async def test_without_a_store_there_is_nothing_to_read_and_nothing_is_promised() -> None:
+    loop = FakeLoop()
+    ui = TelegramUI(
+        settings=Settings(telegram_allowed_users="42"),
+        profile=SimpleNamespace(
+            id="lead", name="Lead", description="", model=None, tool_allowed=lambda _name: True
+        ),
+        agent_loop=loop,
+        memory=MemoryStore(),
+        store=None,
+    )
+    bot = FakeBot()
+    await ui.on_message(make_update(bot, "a", thread=5, topic=True), ctx_for(bot))
+    assert recall.RECALL_NOTE not in loop.runs[0].extra_system
+    assert TOPIC_NOTE in loop.runs[0].extra_system
+
+
+async def test_a_local_model_without_tools_is_not_told_about_them() -> None:
+    """AgentLoop withholds every tool from it; the note would send it looking."""
+    ui, loop, _ = make_ui(
+        models_ollama="qwen",
+        ollama_base_url="http://ollama.invalid",
+        model_default="qwen",
+        model_allowlist="qwen",
+    )
+    bot = FakeBot()
+    await ui.on_message(make_update(bot, "a", thread=5, topic=True), ctx_for(bot))
+    assert loop.runs[0].model == "qwen"
+    assert recall.RECALL_NOTE not in loop.runs[0].extra_system
+    assert TOPIC_NOTE in loop.runs[0].extra_system
+
+
+@pytest.mark.parametrize("error", [StoreUnavailable("ORDS returned HTTP 503"), KeyError("n")])
+async def test_a_listing_that_fails_keeps_the_note_and_the_turn(error: Exception) -> None:
+    """It runs before every turn: a failure here must not end every conversation."""
+    store = FakeStore()
+    store.listing_error = error
+    ui, loop, _ = make_ui(store=store)
+    bot = FakeBot()
+    await ui.on_message(make_update(bot, "a", thread=5, topic=True), ctx_for(bot))
+    assert len(loop.runs) == 1
+    assert loop.runs[0].extra_system.endswith(recall.RECALL_NOTE)
+    assert replies(bot)[-1]["text"] == "re: a"
 
 
 # -- one task at a time per chat, as before -----------------------------------
@@ -535,7 +666,7 @@ async def test_the_topic_note_comes_after_the_facts_it_refers_to() -> None:
     """The note says "факты выше"; placed before them it would point at nothing."""
     store = FakeStore()
     store.facts_known = [Fact(key="k", fact="a durable fact", scope="user", updated_at="")]
-    ui, loop, _ = make_ui(store=store)
+    ui, loop, _ = make_ui(store=store, recall_tools=False)
     bot = FakeBot()
     await ui.on_message(make_update(bot, "a", thread=5, topic=True), ctx_for(bot))
     extra = loop.runs[0].extra_system
@@ -595,7 +726,7 @@ def _params(fn: Any) -> list[str]:
 
 def test_the_fake_store_has_the_real_stores_signatures() -> None:
     """A rename on the real side must fail here, not hide behind a permissive fake."""
-    for name in ("history", "append", "clear", "facts"):
+    for name in ("history", "append", "clear", "facts", "conversations"):
         assert _params(getattr(FakeStore, name)) == _params(getattr(AdbStore, name)), name
 
 

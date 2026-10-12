@@ -15,7 +15,16 @@ import pytest
 
 from agentcore.config import Settings
 from agentcore.llm.base import LLMResponse, ToolCall, Usage
-from agentcore.localtools import FORGET, REMEMBER, call_local, is_local, memory_tools
+from agentcore.localtools import (
+    FORGET,
+    LIST_CONVERSATIONS,
+    READ_CONVERSATION,
+    REMEMBER,
+    SEARCH_CONVERSATIONS,
+    call_local,
+    is_local,
+    memory_tools,
+)
 from agentcore.loop import AgentLoop
 from agentcore.mcp.toolset import build_catalog
 from agentcore.memory import ChatMemory
@@ -54,9 +63,15 @@ def test_no_memory_tools_without_a_store():
     assert memory_tools(None) == []
 
 
-def test_both_memory_tools_are_offered_with_a_store():
+def test_every_memory_tool_is_offered_with_a_store():
     names = [t.qualified_name for t in memory_tools(FakeStore())]
-    assert names == [REMEMBER, FORGET]
+    assert names == [
+        REMEMBER,
+        FORGET,
+        SEARCH_CONVERSATIONS,
+        READ_CONVERSATION,
+        LIST_CONVERSATIONS,
+    ]
 
 
 def test_local_names_are_recognised():
@@ -193,6 +208,7 @@ class ExplodingPool:
 def _loop(store, responses):
     return AgentLoop(
         profile=SimpleNamespace(
+            id="lead",
             max_steps=5,
             max_tokens_per_turn=10_000,
             system_prompt="test",

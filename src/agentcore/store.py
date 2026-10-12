@@ -45,15 +45,19 @@ topic an old message came from, so nothing could have sorted them.
 No vectors yet
 --------------
 Deliberately. Facts number in the dozens and go into the prompt whole, so there
-is nothing to search; history will want search eventually, and the database
-supports it (``VECTOR``, 26ai, checked), but choosing where embeddings come from
-is a separate decision worth making when there is enough history to search.
+is nothing to search. History is searched — the other conversations are reached
+that way, see recall.py — but by plain substring, `lower()` and `dbms_lob.instr`
+over every row, with no index: about 250 ms at two thousand rows, measured on the
+live instance. The database supports vectors (``VECTOR``, 26ai, checked); choosing
+where embeddings come from is a separate decision worth making when the scan is
+too slow or the words people search with stop matching the words they used.
 """
 
 from __future__ import annotations
 
 import json
 import logging
+from collections.abc import Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -69,6 +73,16 @@ _VARCHAR_MAX = 4000
 # the transcript is trimmed by the caller anyway. Storing a 2 MB row helps
 # nobody and makes the next read slow.
 MAX_CONTENT_CHARS = 200_000
+
+# How much of a conversation's first and last user message the listing carries.
+PREVIEW_CHARS = 200
+
+# The search excerpt: this many characters, starting this far before the match.
+EXCERPT_CHARS = 360
+EXCERPT_LEAD = 120
+
+# Past every id the table will hold: "the newest messages" is "everything up to here".
+_NEWEST = 10**15
 
 
 class StoreUnavailable(RuntimeError):
@@ -176,6 +190,42 @@ class Fact:
     fact: str
     scope: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class ConversationSummary:
+    """One conversation of an agent, as the index and the recall tools describe it.
+
+    `first_user` and `last_user` are the opening characters of the person's first and
+    latest message in it, empty when there is none. Times are the database's, UTC.
+    """
+
+    chat_id: int
+    thread_id: int
+    messages: int
+    first_day: str
+    last_at: str
+    first_user: str
+    last_user: str
+
+
+@dataclass(frozen=True)
+class StoredText:
+    """Words from a conversation, the person's or the agent's, as recall shows them.
+
+    `text` is a window of the message rather than all of it: it begins at `start`
+    (1-based, the way Oracle counts) and the whole message is `length` characters,
+    so whoever shows it can say what was left out.
+    """
+
+    id: int
+    chat_id: int
+    thread_id: int
+    role: str
+    at: str
+    text: str
+    start: int
+    length: int
 
 
 class AdbStore:
@@ -383,6 +433,185 @@ class AdbStore:
             log.warning("could not clear history: %s", exc)
             return False
         return True
+
+    # -- the other conversations ---------------------------------------------
+    #
+    # What recall.py and the tools in localtools.py read. Unlike history(), these raise
+    # StoreUnavailable instead of answering empty: a search that failed must reach the
+    # model as a failure, because "nothing was found" is an answer it would pass on as
+    # a fact. Times come back as the database keeps them, UTC.
+
+    async def conversations(self, *, agent: str) -> list[ConversationSummary]:
+        """Every conversation `agent` has had, the most recently active first.
+
+        One statement: the counts per conversation, joined to the first and the latest
+        message the person wrote in it. Tool results are counted but never shown.
+        """
+        statement = (
+            "select o.chat_id, o.thread_id, o.n, o.first_day, o.last_at, "
+            "f.preview as first_user, l.preview as last_user "
+            "from (select chat_id, thread_id, count(*) as n, max(id) as last_id, "
+            "to_char(min(created_at), 'YYYY-MM-DD') as first_day, "
+            "to_char(max(created_at), 'YYYY-MM-DD HH24:MI') as last_at "
+            "from conversations where agent = :agent group by chat_id, thread_id) o "
+            "left join (select chat_id, thread_id, dbms_lob.substr(content, :width, 1) as preview, "
+            "row_number() over (partition by chat_id, thread_id order by id) as rk "
+            "from conversations where agent = :agent and role = 'user' "
+            "and content is not null) f "
+            "on f.chat_id = o.chat_id and f.thread_id = o.thread_id and f.rk = 1 "
+            "left join (select chat_id, thread_id, dbms_lob.substr(content, :width, 1) as preview, "
+            "row_number() over (partition by chat_id, thread_id order by id desc) as rk "
+            "from conversations where agent = :agent and role = 'user' "
+            "and content is not null) l "
+            "on l.chat_id = o.chat_id and l.thread_id = o.thread_id and l.rk = 1 "
+            "order by o.last_id desc"
+        )
+        rows = await self._run(statement, {"agent": agent, "width": PREVIEW_CHARS})
+        return [
+            ConversationSummary(
+                chat_id=int(row["chat_id"]),
+                thread_id=int(row["thread_id"]),
+                messages=int(row["n"]),
+                first_day=row.get("first_day") or "",
+                last_at=row.get("last_at") or "",
+                first_user=row.get("first_user") or "",
+                last_user=row.get("last_user") or "",
+            )
+            for row in rows
+        ]
+
+    async def search(
+        self, *, agent: str, terms: Sequence[str], limit: int
+    ) -> list[StoredText]:
+        """Messages of `agent`'s conversations that contain any of `terms`.
+
+        The person's words and the agent's answers, not tool results: those are most of
+        the table and most of them are file contents and logs, which is noise when the
+        question is what was said. Case-insensitive substring, so a stem finds every
+        form of a word. Ranked by how many of the terms a message has, then newest.
+
+        The terms are binds, never part of the statement text: they come from the model.
+        Only their number shapes the statement. The excerpt starts a little before the
+        first term that matched, because the start of a long answer is rarely the part
+        that was searched for.
+        """
+        terms = [term.lower() for term in terms if term]
+        if not terms:
+            return []
+        binds: dict[str, Any] = {
+            "agent": agent,
+            "lim": limit,
+            "width": EXCERPT_CHARS,
+            "lead": EXCERPT_LEAD,
+        }
+        found: list[str] = []
+        first: list[str] = []
+        for index, term in enumerate(terms):
+            name = f"t{index}"
+            binds[name] = term
+            found.append(f"sign(dbms_lob.instr(lc, :{name}))")
+            first.append(f"nullif(dbms_lob.instr(lc, :{name}), 0)")
+        statement = (
+            "select id, chat_id, thread_id, role, at, len, "
+            "greatest(pos - :lead, 1) as start_at, "
+            "dbms_lob.substr(content, :width, greatest(pos - :lead, 1)) as excerpt "
+            "from (select id, chat_id, thread_id, role, content, "
+            "to_char(created_at, 'YYYY-MM-DD HH24:MI') as at, "
+            "dbms_lob.getlength(content) as len, "
+            f"{' + '.join(found)} as score, "
+            f"coalesce({', '.join(first)}, 1) as pos "
+            "from (select id, chat_id, thread_id, role, created_at, content, "
+            "lower(content) as lc from conversations "
+            "where agent = :agent and role in ('user', 'assistant') "
+            "and content is not null)) "
+            "where score > 0 order by score desc, id desc fetch first :lim rows only"
+        )
+        rows = await self._run(statement, binds)
+        return [
+            StoredText(
+                id=int(row["id"]),
+                chat_id=int(row["chat_id"]),
+                thread_id=int(row["thread_id"]),
+                role=row["role"],
+                at=row.get("at") or "",
+                text=row.get("excerpt") or "",
+                start=int(row.get("start_at") or 1),
+                length=int(row.get("len") or 0),
+            )
+            for row in rows
+        ]
+
+    async def read(
+        self,
+        *,
+        agent: str,
+        chat_id: int,
+        thread_id: int,
+        around: int | None,
+        limit: int,
+        width: int,
+        focus_width: int,
+    ) -> list[StoredText]:
+        """Up to `limit` messages of one conversation, oldest first.
+
+        Without `around`, the newest ones. With it, the messages on both sides of that
+        id, the message itself included and given `focus_width` characters instead of
+        `width`: it is the one a search pointed at. The person's words and the agent's
+        answers only, as in search().
+        """
+        if around is None:
+            focus, before, after = -1, limit, 0
+            upto = _NEWEST
+        else:
+            focus, upto = around, around
+            before = (limit + 1) // 2
+            after = limit - before
+        messages = (
+            "select id, role, to_char(created_at, 'YYYY-MM-DD HH24:MI') as at, "
+            "dbms_lob.substr(content, case when id = :focus then :focus_width "
+            "else :width end, 1) as text, "
+            "dbms_lob.getlength(content) as len "
+            "from conversations "
+            "where agent = :agent and chat_id = :chat_id and thread_id = :thread_id "
+            "and role in ('user', 'assistant') and content is not null "
+        )
+        statement = (
+            f"select * from ({messages} and id <= :upto "
+            "order by id desc fetch first :before rows only)"
+        )
+        binds: dict[str, Any] = {
+            "agent": agent,
+            "chat_id": chat_id,
+            "thread_id": thread_id,
+            "focus": focus,
+            "focus_width": focus_width,
+            "width": width,
+            "upto": upto,
+            "before": before,
+        }
+        if after:
+            statement += (
+                f" union all select * from ({messages} and id > :upto "
+                "order by id fetch first :after rows only)"
+            )
+            binds["after"] = after
+        rows = await self._run(statement, binds)
+        return sorted(
+            (
+                StoredText(
+                    id=int(row["id"]),
+                    chat_id=chat_id,
+                    thread_id=thread_id,
+                    role=row["role"],
+                    at=row.get("at") or "",
+                    text=row.get("text") or "",
+                    start=1,
+                    length=int(row.get("len") or 0),
+                )
+                for row in rows
+            ),
+            key=lambda message: message.id,
+        )
 
     # -- facts about the user ----------------------------------------------
 

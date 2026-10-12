@@ -162,6 +162,12 @@ allow_tools:
   - "cluster__*"
   - "coder__*"
   - "reviewer__*"
+  # In-process, no server behind them (agentcore.localtools): facts about the person,
+  # and reading the other conversations — other topics, General, the private chat.
+  # Missing from this list from the day memory was added, so the facts prompt told the
+  # model to call memory__remember while the catalogue never held it, and the facts
+  # table stayed empty.
+  - "memory__*"
 
 deny_tools:
   - "github__delete_*"

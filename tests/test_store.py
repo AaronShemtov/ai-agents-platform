@@ -16,7 +16,14 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 import pytest
 
-from agentcore.store import MAX_CONTENT_CHARS, AdbStore, StoreSqlError, StoreUnavailable
+from agentcore.store import (
+    MAX_CONTENT_CHARS,
+    AdbStore,
+    ConversationSummary,
+    StoredText,
+    StoreSqlError,
+    StoreUnavailable,
+)
 
 # What the fake ORDS answers next, and what it was asked. Module-level because
 # the handler class cannot easily carry state.
@@ -389,7 +396,7 @@ async def test_every_bind_is_used_by_its_statement_and_the_other_way_round(ords:
     await s.history(agent="lead", chat_id=1, thread_id=2, limit=5)
     await s.clear(agent="lead", chat_id=1, thread_id=2)
     for request in _requests:
-        named = set(re.findall(r":([a-z_]+)", request["statementText"]))
+        named = set(re.findall(r":([a-z_][a-z0-9_]*)", request["statementText"]))
         assert named == set(binds_of(request)), request["statementText"]
 
 
@@ -476,3 +483,199 @@ async def test_structured_content_is_stored_as_json(ords: str) -> None:
     assert json.loads(binds_of(_requests[0])["content"]["value"]) == [
         {"type": "text", "text": "hi"}
     ]
+
+
+# -- the other conversations -------------------------------------------------
+
+
+def bound(request: dict) -> dict:
+    return {name: bind["value"] for name, bind in binds_of(request).items()}
+
+
+async def test_the_conversations_of_one_agent_are_listed_newest_first(ords: str) -> None:
+    _replies.append(
+        (
+            200,
+            rows(
+                {
+                    "chat_id": -100123,
+                    "thread_id": 78,
+                    "n": 4,
+                    "first_day": "2026-10-11",
+                    "last_at": "2026-10-11 21:42",
+                    "first_user": "начало темы",
+                    "last_user": None,
+                },
+                {
+                    "chat_id": 555,
+                    "thread_id": 0,
+                    "n": 505,
+                    "first_day": "2026-09-06",
+                    "last_at": "2026-10-06 19:25",
+                    "first_user": None,
+                    "last_user": "",
+                },
+            ),
+        )
+    )
+    got = await store(ords).conversations(agent="lead")
+    assert got == [
+        ConversationSummary(
+            chat_id=-100123,
+            thread_id=78,
+            messages=4,
+            first_day="2026-10-11",
+            last_at="2026-10-11 21:42",
+            first_user="начало темы",
+            last_user="",
+        ),
+        ConversationSummary(
+            chat_id=555,
+            thread_id=0,
+            messages=505,
+            first_day="2026-09-06",
+            last_at="2026-10-06 19:25",
+            first_user="",
+            last_user="",
+        ),
+    ]
+    statement = _requests[0]["statementText"]
+    assert statement.count("agent = :agent") == 3  # the counts and both previews
+    assert statement.endswith("order by o.last_id desc")
+    assert bound(_requests[0])["agent"] == "lead"
+
+
+async def test_a_listing_that_fails_is_an_error_rather_than_no_conversations(ords: str) -> None:
+    """history() answers [] when the database is down, because a turn goes on without
+    it. A tool cannot: "there are no other conversations" is a claim about the past."""
+    _replies.append((503, "down"))
+    with pytest.raises(StoreUnavailable):
+        await store(ords).conversations(agent="lead")
+    _replies.append((200, json.dumps({"items": [{"errorMessage": "ORA-00904: invalid"}]})))
+    with pytest.raises(StoreSqlError):
+        await store(ords).conversations(agent="lead")
+
+
+async def test_search_terms_are_binds_and_never_part_of_the_statement(ords: str) -> None:
+    """They come from the model, which is reading whatever the conversation contained."""
+    await store(ords).search(agent="lead", terms=["Кластер", "x' or 1=1 --"], limit=5)
+    request = _requests[0]
+    values = bound(request)
+    assert values["t0"] == "кластер"  # lower case, to meet lower(content)
+    assert values["t1"] == "x' or 1=1 --"
+    assert "кластер" not in request["statementText"]
+    assert "1=1" not in request["statementText"]
+    assert (values["agent"], values["lim"]) == ("lead", 5)
+
+
+async def test_search_reads_what_was_said_and_not_what_tools_returned(ords: str) -> None:
+    await store(ords).search(agent="lead", terms=["oracle"], limit=1)
+    statement = _requests[0]["statementText"]
+    assert "role in ('user', 'assistant')" in statement
+    assert "agent = :agent" in statement
+
+
+async def test_search_ranks_by_how_many_terms_matched_then_newest(ords: str) -> None:
+    await store(ords).search(agent="lead", terms=["a1", "b2"], limit=3)
+    statement = _requests[0]["statementText"]
+    assert "sign(dbms_lob.instr(lc, :t0)) + sign(dbms_lob.instr(lc, :t1)) as score" in statement
+    assert "where score > 0 order by score desc, id desc" in statement
+
+
+async def test_no_terms_means_no_query_at_all(ords: str) -> None:
+    assert await store(ords).search(agent="lead", terms=[], limit=5) == []
+    assert await store(ords).search(agent="lead", terms=[""], limit=5) == []
+    assert _requests == []
+
+
+async def test_a_hit_says_where_its_excerpt_sits_in_the_message(ords: str) -> None:
+    _replies.append(
+        (
+            200,
+            rows(
+                {
+                    "id": 1853,
+                    "chat_id": -100123,
+                    "thread_id": 78,
+                    "role": "user",
+                    "at": "2026-10-11 21:42",
+                    "len": 900,
+                    "start_at": 401,
+                    "excerpt": "загадал число 7",
+                }
+            ),
+        )
+    )
+    [hit] = await store(ords).search(agent="lead", terms=["число"], limit=5)
+    assert hit == StoredText(
+        id=1853,
+        chat_id=-100123,
+        thread_id=78,
+        role="user",
+        at="2026-10-11 21:42",
+        text="загадал число 7",
+        start=401,
+        length=900,
+    )
+
+
+async def test_reading_the_newest_messages_asks_for_nothing_after_them(ords: str) -> None:
+    await store(ords).read(
+        agent="lead", chat_id=-100123, thread_id=78, around=None, limit=12, width=600,
+        focus_width=2500,
+    )
+    request = _requests[0]
+    values = bound(request)
+    assert "union all" not in request["statementText"]
+    assert values["before"] == 12
+    assert "after" not in values
+    assert values["focus"] == -1  # no message is singled out
+    assert values["upto"] >= 10**15
+
+
+async def test_reading_around_a_message_takes_both_sides_and_widens_that_one(ords: str) -> None:
+    await store(ords).read(
+        agent="lead", chat_id=-100123, thread_id=78, around=1853, limit=5, width=600,
+        focus_width=2500,
+    )
+    request = _requests[0]
+    values = bound(request)
+    assert "union all" in request["statementText"]
+    assert (values["before"], values["after"]) == (3, 2)  # the message itself is in before
+    assert values["upto"] == values["focus"] == 1853
+    assert (values["width"], values["focus_width"]) == (600, 2500)
+    assert (values["agent"], values["chat_id"], values["thread_id"]) == ("lead", -100123, 78)
+    assert request["statementText"].count("thread_id = :thread_id") == 2
+
+
+async def test_a_read_comes_back_oldest_first_in_whatever_order_it_arrives(ords: str) -> None:
+    _replies.append(
+        (
+            200,
+            rows(
+                {"id": 12, "role": "assistant", "at": "t", "text": "b", "len": 1},
+                {"id": 10, "role": "user", "at": "t", "text": "a", "len": 1},
+                {"id": 14, "role": "user", "at": "t", "text": "c", "len": 5},
+            ),
+        )
+    )
+    got = await store(ords).read(
+        agent="lead", chat_id=1, thread_id=0, around=12, limit=3, width=10, focus_width=20
+    )
+    assert [m.id for m in got] == [10, 12, 14]
+    assert all((m.chat_id, m.thread_id, m.start) == (1, 0, 1) for m in got)
+    assert got[-1].length == 5
+
+
+async def test_every_recall_statement_names_exactly_the_binds_it_is_sent(ords: str) -> None:
+    s = store(ords)
+    await s.conversations(agent="lead")
+    await s.search(agent="lead", terms=["a1", "b2", "c3"], limit=4)
+    await s.read(agent="lead", chat_id=1, thread_id=2, around=None, limit=3, width=10, focus_width=20)
+    await s.read(agent="lead", chat_id=1, thread_id=2, around=7, limit=3, width=10, focus_width=20)
+    assert len(_requests) == 4
+    for request in _requests:
+        named = set(re.findall(r":([a-z_][a-z0-9_]*)", request["statementText"]))
+        assert named == set(binds_of(request)), request["statementText"]
+        for name, bind in binds_of(request).items():
+            assert "data_type" in bind, name

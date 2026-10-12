@@ -38,8 +38,10 @@ from telegram.ext import (
     filters,
 )
 
+from agentcore import recall
 from agentcore.audit import AuditLog
 from agentcore.config import Settings
+from agentcore.localtools import SEARCH_CONVERSATIONS
 from agentcore.loop import AgentLoop
 from agentcore.memory import ChatMemory, ConversationKey, MemoryStore
 from agentcore.profiles import AgentProfile
@@ -58,9 +60,12 @@ APPROVAL_TIMEOUT = 600.0  # seconds to wait for a button press
 # means "no topic".
 GENERAL_TOPIC_ID = 1
 
-# Appended to the system prompt inside a topic, after the facts. The model otherwise
-# has no way to know the topic is one of several, and an empty history in a new topic
-# reads as "we have not talked", which invites a guess about what was said elsewhere.
+# Appended to the system prompt inside a topic, after the facts, when the agent cannot
+# read the other conversations — no database, a profile without memory__*, a local
+# model with no tools. The model otherwise has no way to know the topic is one of
+# several, and an empty history in a new topic reads as "we have not talked", which
+# invites a guess about what was said elsewhere. When it can read them, recall.RECALL_NOTE
+# says so instead.
 TOPIC_NOTE = (
     "Этот разговор идёт в отдельной теме группы. Других тем ты не видишь и не "
     "помнишь: если человек ссылается на то, что обсуждали в другой теме, скажи, что "
@@ -242,14 +247,44 @@ class TelegramUI:
             f"{lines}\n\n" + keeping
         )
 
-    async def _extra_system(self, thread_id: int) -> str:
-        """What goes after the profile's prompt: the facts, then in a topic the note
-        that it is one of several. The history of the topic follows in the transcript,
-        so the order the model reads is the facts, then this topic."""
-        parts = [await self._facts_prompt()]
-        if thread_id:
-            parts.append(TOPIC_NOTE)
+    async def _extra_system(self, key: ConversationKey, model: str) -> str:
+        """What goes after the profile's prompt: the facts, then where this conversation
+        stands among the others. Its own history follows in the transcript, so the order
+        the model reads is the facts, the note and the index of the other conversations,
+        then this one — first priority by being the history itself."""
+        if not self._recall_offered(model):
+            parts = [await self._facts_prompt(), TOPIC_NOTE if key.thread_id else ""]
+        else:
+            parts = list(
+                await asyncio.gather(self._facts_prompt(), self._recall_prompt(key))
+            )
         return "\n\n".join(part for part in parts if part)
+
+    def _recall_offered(self, model: str) -> bool:
+        """Whether this turn's model will hold the tools the recall note points at.
+
+        A note about tools the catalogue does not have sends the model looking for
+        them, and it then reports that it cannot see the other topics in a stranger way
+        than TOPIC_NOTE says it plainly.
+        """
+        if self._store is None or not self._profile.tool_allowed(SEARCH_CONVERSATIONS):
+            return False
+        # Mirrors AgentLoop.run, which withholds every tool from such a model.
+        return not (self._s.is_local_model(model) and not self._s.local_tools)
+
+    async def _recall_prompt(self, key: ConversationKey) -> str:
+        """The recall note and the index of the other conversations.
+
+        Never raises. It runs before every turn, so a failure here would end every
+        conversation at once over a list that is only there to help; without the list
+        the note still stands, and the tools may work by the time they are called.
+        """
+        try:
+            conversations = await self._store.conversations(agent=self._profile.id)
+        except Exception as exc:  # broad on purpose, see above
+            logger.warning("could not list the other conversations: %s", exc)
+            conversations = None
+        return recall.prompt_block(conversations, key)
 
     @staticmethod
     def _key(update: Update) -> ConversationKey:
@@ -555,7 +590,7 @@ class TelegramUI:
                 progress=progress,
                 approver=self._make_approver(ctx, chat_id, key.thread_id),
                 cancel=cancel,
-                extra_system=await self._extra_system(key.thread_id),
+                extra_system=await self._extra_system(key, model),
             )
             await progress.finish()
             await self._send_long(update, result.text or "(пустой ответ)")

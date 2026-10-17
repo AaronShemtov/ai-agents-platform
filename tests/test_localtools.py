@@ -15,7 +15,16 @@ import pytest
 
 from agentcore.config import Settings
 from agentcore.llm.base import LLMResponse, ToolCall, Usage
-from agentcore.localtools import FORGET, REMEMBER, call_local, is_local, memory_tools
+from agentcore.localtools import (
+    FORGET,
+    LIST_CONVERSATIONS,
+    READ_CONVERSATION,
+    REMEMBER,
+    SEARCH_CONVERSATIONS,
+    call_local,
+    is_local,
+    memory_tools,
+)
 from agentcore.loop import AgentLoop
 from agentcore.mcp.toolset import build_catalog
 from agentcore.memory import ChatMemory
@@ -45,6 +54,9 @@ class FakeStore:
         self.forgotten.append(key)
         return self._existed
 
+    async def facts(self, *, scope=None):
+        return [SimpleNamespace(key="git-identity"), SimpleNamespace(key="deploys")]
+
 
 # -- what is offered ---------------------------------------------------------
 
@@ -54,9 +66,15 @@ def test_no_memory_tools_without_a_store():
     assert memory_tools(None) == []
 
 
-def test_both_memory_tools_are_offered_with_a_store():
+def test_every_memory_tool_is_offered_with_a_store():
     names = [t.qualified_name for t in memory_tools(FakeStore())]
-    assert names == [REMEMBER, FORGET]
+    assert names == [
+        REMEMBER,
+        FORGET,
+        SEARCH_CONVERSATIONS,
+        READ_CONVERSATION,
+        LIST_CONVERSATIONS,
+    ]
 
 
 def test_local_names_are_recognised():
@@ -138,6 +156,8 @@ def test_forget_says_whether_there_was_anything_to_forget():
     )
     assert present.ok and "забыто" in present.text
     assert absent.ok and "нечего забывать" in absent.text
+    # A guessed key is the usual miss: the keys there are come back with it.
+    assert "git-identity, deploys" in absent.text
 
 
 def test_a_failed_write_comes_back_as_a_failure_rather_than_an_exception():
@@ -193,6 +213,7 @@ class ExplodingPool:
 def _loop(store, responses):
     return AgentLoop(
         profile=SimpleNamespace(
+            id="lead",
             max_steps=5,
             max_tokens_per_turn=10_000,
             system_prompt="test",
@@ -249,6 +270,33 @@ def test_the_loop_runs_the_memory_tool_itself_and_records_the_chat():
             "chat_id": 77,
         }
     ]
+    # Said under the answer: the fact goes into every later prompt, and the progress
+    # line that named the call is deleted when the turn ends.
+    assert "запомнил\n\n📌 Запомнил: Собирает только в CI (удалить: /forget deploys)" in result.text
+
+
+def _forget_turn(existed: bool):
+    store = FakeStore(existed=existed)
+    loop = _loop(
+        store,
+        [
+            LLMResponse(
+                content=None,
+                tool_calls=[ToolCall(id="1", name=FORGET, arguments={"key": "deploys"})],
+                usage=Usage(prompt_tokens=10, completion_tokens=1),
+                finish_reason="tool_calls",
+            ),
+            LLMResponse(content="ок", usage=Usage(prompt_tokens=12, completion_tokens=1), finish_reason="stop"),
+        ],
+    )
+    return asyncio.run(
+        loop.run(chat=ChatMemory(chat_id=77), user_text="забудь", model="m", audit=FakeAudit())
+    )
+
+
+def test_a_forget_is_said_under_the_answer_only_when_something_was_forgotten() -> None:
+    assert "🗑 Забыл: deploys" in _forget_turn(existed=True).text
+    assert "Забыл" not in _forget_turn(existed=False).text
 
 
 def test_the_loop_offers_no_memory_tools_when_memory_is_off():

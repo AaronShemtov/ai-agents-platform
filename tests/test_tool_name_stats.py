@@ -106,7 +106,7 @@ def make_loop(aliases, *, mapping=None, decision=Decision.ALLOW, failure=False):
     pool = SimpleNamespace(call_tool=AsyncMock(return_value=ToolResult(ok=not failure, text="private-result")))
     policy = SimpleNamespace(evaluate=lambda _name, _args: SimpleNamespace(decision=decision, reason="test"))
     loop = AgentLoop(
-        profile=SimpleNamespace(max_steps=5, max_tokens_per_turn=10000, system_prompt="test", tool_allowed=lambda _: True),
+        profile=SimpleNamespace(id="test", max_steps=5, max_tokens_per_turn=10000, system_prompt="test", tool_allowed=lambda _: True),
         settings=Settings(), llm=llm, pool=pool, policy=policy,
     )
     loop.catalog = AsyncMock(return_value=ToolCatalog(

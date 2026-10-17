@@ -29,7 +29,7 @@ from agentcore.audit import AuditLog, Timer
 from agentcore.config import Settings
 from agentcore.llm.azure import RAW_OUTPUT_KEY
 from agentcore.llm.base import LLMClient, LLMError, ToolCall, Usage
-from agentcore.localtools import call_local, is_local, memory_tools
+from agentcore.localtools import FORGET, REMEMBER, call_local, is_local, memory_tools
 from agentcore.mcp.client import MCPPool
 from agentcore.mcp.toolset import ToolCatalog, build_catalog
 from agentcore.memory import ChatMemory
@@ -137,8 +137,13 @@ class AgentLoop:
         # In-process tools join the remote ones before filtering, so a profile
         # denies `memory__*` exactly the way it denies anything else.
         tools = await self._pool.list_tools(force_refresh=force_refresh)
+        # Reading the other conversations only while one person may talk to the agent:
+        # rows carry no author, so with two the tools would read one's private chat to
+        # the other.
+        recall = len(self._settings.allowed_user_ids()) == 1
         return build_catalog(
-            tools + memory_tools(self._store), is_allowed=self._profile.tool_allowed
+            tools + memory_tools(self._store, recall=recall),
+            is_allowed=self._profile.tool_allowed,
         )
 
     async def run(
@@ -185,6 +190,9 @@ class AgentLoop:
         tool_calls = 0
         tool_duration_ms = 0
         tool_names: list[str] = []
+        # What the turn remembered or forgot, said under the answer: a fact goes into
+        # every later prompt, and the progress line that named the call is deleted.
+        memory_notes: list[str] = []
 
         while steps < self.max_steps:
             if cancel is not None and cancel.is_set():
@@ -285,6 +293,8 @@ class AgentLoop:
                     progress=progress,
                     approver=approver,
                     chat_id=chat.chat_id,
+                    thread_id=chat.thread_id,
+                    notes=memory_notes,
                 )
                 if called:
                     tool_calls += 1
@@ -301,6 +311,9 @@ class AgentLoop:
             )
 
         duration_ms = int((time.monotonic() - started) * 1000)
+        if memory_notes:
+            notes = "\n".join(memory_notes)
+            answer = f"{answer.rstrip()}\n\n{notes}" if answer.strip() else notes
         answer = append_usage_footer(
             answer,
             format_usage_footer(
@@ -349,6 +362,8 @@ class AgentLoop:
         progress: ProgressFn,
         approver: ApproverFn,
         chat_id: int | None = None,
+        thread_id: int = 0,
+        notes: list[str] | None = None,
     ) -> tuple[str, bool, int]:
         qualified = catalog.resolve(call.name)
         if qualified is None:
@@ -430,9 +445,20 @@ class AgentLoop:
 
         with Timer() as timer:
             if is_local(qualified):
+                # The conversation the turn is in: the reading tools read this agent's
+                # rows only and mark this conversation among the others.
                 result = await call_local(
-                    qualified, call.arguments, store=self._store, chat_id=chat_id
+                    qualified,
+                    call.arguments,
+                    store=self._store,
+                    agent=self._profile.id,
+                    chat_id=chat_id,
+                    thread_id=thread_id,
                 )
+                if notes is not None and result.ok:
+                    note = _memory_note(qualified, call.arguments, result.text)
+                    if note:
+                        notes.append(note)
             else:
                 result = await self._pool.call_tool(qualified, call.arguments)
 
@@ -462,6 +488,21 @@ def _serialise_call(call: ToolCall) -> dict[str, Any]:
             "arguments": json.dumps(call.arguments, ensure_ascii=False),
         },
     }
+
+
+def _memory_note(qualified: str, arguments: dict[str, Any], said: str) -> str | None:
+    """The line under an answer that says a fact was kept or dropped, with the command
+    that undoes it. Only for what happened: a fact not kept, or a key that was not
+    there to forget, is not news."""
+    key = str(arguments.get("key") or "").strip()
+    if not key:
+        return None
+    if qualified == REMEMBER:
+        fact = " ".join(str(arguments.get("fact") or "").split())
+        return f"📌 Запомнил: {fact} (удалить: /forget {key})" if fact else None
+    if qualified == FORGET and said.startswith("забыто"):
+        return f"🗑 Забыл: {key}"
+    return None
 
 
 def _clip(text: str) -> str:

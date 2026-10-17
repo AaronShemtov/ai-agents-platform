@@ -81,7 +81,12 @@ class FakeStore:
     async def clear(self, *, agent: str, chat_id: int, thread_id: int) -> bool:
         if not self.clear_works:
             return False
-        self.rows.pop((agent, chat_id, thread_id), None)
+        key = (agent, chat_id, thread_id)
+        self.rows.pop(key, None)
+        # A cleared conversation is gone from the listing too. Left in `touched`, the
+        # listing raised KeyError on it, and the front door's broad except hid that.
+        if key in self.touched:
+            self.touched.remove(key)
         return True
 
     async def facts(self, *, scope: str | None = None) -> list[Fact]:
@@ -448,6 +453,18 @@ async def test_the_index_names_the_other_conversations_and_not_this_one() -> Non
     assert "личный чат" in second
     assert "тема 5" not in second  # its own history is the transcript, not a line here
     assert "тема 3" not in second  # another agent's conversations are not this agent's
+
+
+async def test_a_topic_cleared_with_new_drops_out_of_the_other_topics_index() -> None:
+    ui, loop, _ = make_ui()
+    bot = FakeBot()
+    await ui.on_message(make_update(bot, "про базу", thread=5, topic=True), ctx_for(bot))
+    await ui.on_message(make_update(bot, "про другое", thread=9, topic=True), ctx_for(bot))
+    assert "тема 5" in loop.runs[-1].extra_system
+    await ui.cmd_new(make_update(bot, "/new", thread=5, topic=True, command=True), ctx_for(bot))
+    await ui.on_message(make_update(bot, "ещё", thread=9, topic=True), ctx_for(bot))
+    assert "тема 5" not in loop.runs[-1].extra_system
+    assert "Других разговоров с ним пока нет." in loop.runs[-1].extra_system
 
 
 async def test_the_prompt_reads_facts_then_the_note_then_the_index() -> None:

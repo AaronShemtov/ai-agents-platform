@@ -733,3 +733,38 @@ async def test_every_recall_statement_names_exactly_the_binds_it_is_sent(ords: s
         assert named == set(binds_of(request)), request["statementText"]
         for name, bind in binds_of(request).items():
             assert "data_type" in bind, name
+
+
+# -- the export ----------------------------------------------------------------
+
+
+async def test_a_dump_pages_through_one_conversation_by_id(ords: str) -> None:
+    """ORDS stops an answer at 10,000 rows; paging by id never meets that, and a short
+    page is the last one."""
+    _replies.append((200, rows(*[{"id": i, "role": "user", "at": "t", "content": "x"} for i in (5, 6)])))
+    _replies.append((200, rows({"id": 9, "role": "user", "at": "t", "content": "y"})))
+    pages = [
+        [row["id"] for row in page]
+        async for page in store(ords).dump(agent="lead", chat_id=-100123, thread_id=7, page=2)
+    ]
+    assert pages == [[5, 6], [9]]
+    first, second = (bound(request) for request in _requests)
+    assert (first["after"], second["after"]) == (0, 6)
+    assert first["page"] == 2
+    assert (first["agent"], first["chat_id"], first["thread_id"]) == ("lead", -100123, 7)
+    statement = _requests[0]["statementText"]
+    assert "thread_id = :thread_id and id > :after order by id fetch first :page rows only" in statement
+    assert "tool_calls" in statement  # all of it: calls and results are memory too
+
+
+async def test_an_empty_conversation_dumps_nothing_in_one_request(ords: str) -> None:
+    pages = [page async for page in store(ords).dump(agent="lead", chat_id=1, thread_id=0)]
+    assert pages == []
+    assert len(_requests) == 1
+
+
+async def test_a_dump_that_fails_is_an_error_not_a_short_file(ords: str) -> None:
+    _replies.append((503, "down"))
+    with pytest.raises(StoreUnavailable):
+        async for _ in store(ords).dump(agent="lead", chat_id=1, thread_id=0):
+            pass

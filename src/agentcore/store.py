@@ -57,7 +57,7 @@ from __future__ import annotations
 
 import json
 import logging
-from collections.abc import Sequence
+from collections.abc import AsyncIterator, Sequence
 from dataclasses import dataclass
 from typing import Any
 
@@ -651,6 +651,41 @@ class AdbStore:
             ),
             key=lambda message: message.id,
         )
+
+    async def dump(
+        self, *, agent: str, chat_id: int, thread_id: int, page: int = 200
+    ) -> AsyncIterator[list[dict[str, Any]]]:
+        """Every stored row of one conversation, oldest first, a page at a time.
+
+        For /export, which shows the person all of it: tool calls and tool results
+        included, because they are replayed as history like anything else. Paged by id
+        rather than in one statement: ORDS stops an answer at 10,000 rows (it says so
+        with `hasMore`, which a single read would ignore), and a page of a few hundred
+        rows stays a few megabytes at most even when they are file contents.
+        """
+        statement = (
+            "select id, role, to_char(created_at, 'YYYY-MM-DD HH24:MI') as at, "
+            "content, tool_calls from conversations "
+            "where agent = :agent and chat_id = :chat_id and thread_id = :thread_id "
+            "and id > :after order by id fetch first :page rows only"
+        )
+        after = 0
+        while True:
+            rows = await self._run(
+                statement,
+                {
+                    "agent": agent,
+                    "chat_id": chat_id,
+                    "thread_id": thread_id,
+                    "after": after,
+                    "page": page,
+                },
+            )
+            if rows:
+                yield rows
+            if len(rows) < page:
+                return
+            after = int(rows[-1]["id"])
 
     # -- facts about the user ----------------------------------------------
 

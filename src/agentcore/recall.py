@@ -216,7 +216,7 @@ class Atlas:
         return "; ".join(shown) + (f"; и ещё {more}" if more > 0 else "")
 
 
-def _one_line(text: str | None, limit: int, *, cut: bool = False) -> str:
+def one_line(text: str | None, limit: int, *, cut: bool = False) -> str:
     """One line of at most `limit` characters, secrets removed, an ellipsis where
     something was left out — here or already by the database (`cut`)."""
     flat = " ".join(redact_secrets(text or "").split())
@@ -261,7 +261,7 @@ def index_block(
         name = atlas.label(c.chat_id, c.thread_id)
         parts = [f"{name} ({link})" if link else f"{name} (id {handle(c.chat_id, c.thread_id)})"]
         if c.thread_id and c.first_user:
-            first = _one_line(c.first_user, INDEX_PREVIEW, cut=c.first_user_cut)
+            first = one_line(c.first_user, INDEX_PREVIEW, cut=c.first_user_cut)
             parts.append(f"первое сообщение: «{first}»")
         elif not c.thread_id and c.chat_id in atlas.forums:
             parts.append("общая часть группы; в ней же всё, что было до разделения по темам")
@@ -331,10 +331,10 @@ def format_list(
                 f"  сообщений: {c.messages}, с {c.first_day} по {c.last_at}",
             ]
             if c.first_user:
-                first = _one_line(c.first_user, LIST_PREVIEW, cut=c.first_user_cut)
+                first = one_line(c.first_user, LIST_PREVIEW, cut=c.first_user_cut)
                 lines.append(f"  первое от человека: «{first}»")
             if c.last_user and c.last_user != c.first_user:
-                last = _one_line(c.last_user, LIST_PREVIEW, cut=c.last_user_cut)
+                last = one_line(c.last_user, LIST_PREVIEW, cut=c.last_user_cut)
                 lines.append(f"  последнее от человека: «{last}»")
             block = "\n".join(lines)
         else:

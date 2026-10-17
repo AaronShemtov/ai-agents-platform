@@ -39,6 +39,16 @@ class FakeBot:
     def __init__(self) -> None:
         self.sent: list[dict[str, Any]] = []
         self.deleted: list[dict[str, Any]] = []
+        self.documents: list[dict[str, Any]] = []
+        self.refuse_documents = False
+
+    async def send_document(self, **kwargs: Any) -> SimpleNamespace:
+        if self.refuse_documents:
+            from telegram.error import Forbidden
+
+            raise Forbidden("bot can't initiate conversation with a user")
+        self.documents.append(kwargs)
+        return SimpleNamespace(message_id=2000 + len(self.documents))
 
     async def send_message(self, **kwargs: Any) -> SimpleNamespace:
         self.sent.append(kwargs)
@@ -91,6 +101,15 @@ class FakeStore:
 
     async def facts(self, *, scope: str | None = None) -> list[Fact]:
         return list(self.facts_known)
+
+    async def dump(self, *, agent: str, chat_id: int, thread_id: int, page: int = 200):
+        stored = self.rows.get((agent, chat_id, thread_id), [])
+        if stored:
+            yield [
+                {"id": index, "role": m.get("role"), "at": "2026-10-17 20:00",
+                 "content": m.get("content"), "tool_calls": None}
+                for index, m in enumerate(stored, start=1)
+            ]
 
     async def conversations(self, *, agent: str) -> list[ConversationSummary]:
         """Newest first, as the real one orders them: the ones written to last, then
@@ -851,9 +870,76 @@ def _params(fn: Any) -> list[str]:
 
 def test_the_fake_store_has_the_real_stores_signatures() -> None:
     """A rename on the real side must fail here, not hide behind a permissive fake."""
-    for name in ("history", "append", "clear", "facts", "conversations"):
+    for name in ("history", "append", "clear", "facts", "conversations", "dump"):
         assert _params(getattr(FakeStore, name)) == _params(getattr(AdbStore, name)), name
 
 
 def test_the_fake_loop_has_the_real_loops_signature() -> None:
     assert _params(FakeLoop.run) == _params(AgentLoop.run)
+
+
+# -- what the bot keeps about the person ----------------------------------------
+
+
+async def test_memories_shows_the_conversations_even_with_no_facts() -> None:
+    """It answered "nothing is recorded about you" while a thousand messages were."""
+    store = FakeStore()
+    store.rows[("lead", GROUP, 9)] = [{"role": "user", "content": "про собеседование"}]
+    store.rows[("lead", PRIVATE, 0)] = [{"role": "user", "content": "в личке"}]
+    ui, _, _ = make_ui(store=store)
+    bot = FakeBot()
+    await ui.cmd_memories(make_update(bot, "/memories", thread=5, topic=True, command=True), ctx_for(bot))
+    said = "\n".join(m["text"] for m in replies(bot))
+    assert "Что я о тебе храню" in said
+    assert "пока ни одного" in said  # no facts, and it says so
+    assert "тема 9" in said
+    assert "личный чат" in said
+    assert "/export" in said
+
+
+async def test_memories_lists_the_facts_with_their_keys() -> None:
+    store = FakeStore()
+    store.facts_known = [Fact(key="git-identity", fact="Коммитит как A", scope="user", updated_at="")]
+    ui, _, _ = make_ui(store=store)
+    bot = FakeBot()
+    await ui.cmd_memories(make_update(bot, "/memories", command=True), ctx_for(bot))
+    assert "git-identity" in replies(bot)[-1]["text"]
+
+
+async def test_export_asked_in_the_group_arrives_in_the_private_chat() -> None:
+    store = FakeStore()
+    store.rows[("lead", GROUP, 9)] = [{"role": "user", "content": "в теме"}]
+    store.rows[("lead", PRIVATE, 0)] = [{"role": "user", "content": "в личке"}]
+    ui, _, _ = make_ui(store=store)
+    bot = FakeBot()
+    await ui.cmd_export(make_update(bot, "/export", thread=9, topic=True, command=True), ctx_for(bot))
+    [document] = bot.documents
+    assert document["chat_id"] == 42  # the person, not the group
+    assert document["filename"].startswith("memory-lead-")
+    body = document["document"].decode("utf-8")
+    assert "в теме" in body and "в личке" in body
+    assert "в личку" in replies(bot)[-1]["text"]
+
+
+async def test_export_in_the_private_chat_just_sends_the_file() -> None:
+    ui, _, _ = make_ui()
+    bot = FakeBot()
+    await ui.cmd_export(make_update(bot, "/export", chat_id=42, command=True), ctx_for(bot))
+    assert bot.documents[0]["chat_id"] == 42
+    assert not [m for m in replies(bot) if "в личку" in m["text"]]
+
+
+async def test_export_says_what_to_do_when_the_private_chat_was_never_started() -> None:
+    ui, _, _ = make_ui()
+    bot = FakeBot()
+    bot.refuse_documents = True
+    await ui.cmd_export(make_update(bot, "/export", thread=9, topic=True, command=True), ctx_for(bot))
+    assert "Start" in replies(bot)[-1]["text"]
+
+
+async def test_the_model_is_told_how_to_answer_what_it_knows_about_the_person() -> None:
+    ui, loop, _ = make_ui()
+    bot = FakeBot()
+    await ui.on_message(make_update(bot, "что ты обо мне знаешь?", thread=5, topic=True), ctx_for(bot))
+    extra = loop.runs[0].extra_system
+    assert "/memories" in extra and "/export" in extra

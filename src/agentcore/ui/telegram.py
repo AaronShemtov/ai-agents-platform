@@ -28,7 +28,7 @@ from typing import Any
 
 from telegram import InlineKeyboardButton, InlineKeyboardMarkup, Update
 from telegram.constants import ParseMode
-from telegram.error import BadRequest
+from telegram.error import BadRequest, Forbidden
 from telegram.ext import (
     Application,
     CallbackQueryHandler,
@@ -38,7 +38,7 @@ from telegram.ext import (
     filters,
 )
 
-from agentcore import recall
+from agentcore import export, recall
 from agentcore.audit import AuditLog
 from agentcore.config import Settings
 from agentcore.localtools import (
@@ -49,7 +49,7 @@ from agentcore.localtools import (
 from agentcore.loop import AgentLoop
 from agentcore.memory import ChatMemory, ConversationKey, MemoryStore
 from agentcore.profiles import AgentProfile
-from agentcore.store import AdbStore
+from agentcore.store import AdbStore, StoreUnavailable
 from agentcore.ui import tgmd
 
 logger = logging.getLogger(__name__)
@@ -271,7 +271,10 @@ class TelegramUI:
             "memory__remember, не спрашивая разрешения и не откладывая на потом. "
             "Узнал точнее — вызови ещё раз с тем же ключом, это заменит старое. "
             "Разовые детали текущей задачи запоминать не надо: они и так в истории "
-            "этого разговора."
+            "этого разговора. Если спрашивают, что ты о нём знаешь или что у тебя в "
+            "памяти, — перечисли факты и разговоры (memory__list_conversations) и "
+            "подскажи: /memories показывает всё это по порядку, /export присылает "
+            "каждое сохранённое сообщение файлом в личку."
         )
 
         facts = await self._store.facts()
@@ -375,7 +378,8 @@ class TelegramUI:
         await update.effective_message.reply_text(
             "<b>Команды</b>\n"
             "/new — забыть контекст этой темы (в чате без тем — всего чата)\n"
-            "/memories — что я помню о тебе\n"
+            "/memories — всё, что я о тебе храню: факты и разговоры\n"
+            "/export — выгрузить всё это файлом, каждое сообщение (пришлю в личку)\n"
             "/forget &lt;ключ&gt; — удалить один факт о тебе\n"
             "/model &lt;имя&gt; — сменить модель для этого чата\n"
             "/models — какие модели доступны\n"
@@ -419,11 +423,12 @@ class TelegramUI:
         )
 
     async def cmd_memories(self, update: Update, _ctx: ContextTypes.DEFAULT_TYPE) -> None:
-        """What the agent believes about the user, and how to remove any of it.
+        """Everything the agent keeps about the user, and how to remove any of it.
 
         The point of putting memory in a database was that it can be read back
         and actually deleted. Without this command that is a claim nobody can
-        check.
+        check. It used to show the facts alone, and with none stored it answered
+        "nothing is recorded about you" over a thousand stored messages.
         """
         if not self._authorised(update):
             return await self._refuse(update)
@@ -432,11 +437,12 @@ class TelegramUI:
                 "Долговременная память не подключена — я помню только текущий разговор."
             )
             return
-        facts = await self._store.facts()
-        if not facts:
+        try:
+            conversations = await self._store.conversations(agent=self._profile.id)
+        except StoreUnavailable as exc:
+            logger.warning("could not list conversations for /memories: %s", exc)
             await update.effective_message.reply_text(
-                "Пока ничего о тебе не записано. Диктовать ничего не надо — "
-                "я сам сохраняю то, что пригодится в следующих разговорах."
+                "Не смог прочитать базу памяти, причина — в логе агента. Попробуй позже."
             )
             return
         # Markdown through _send_long, which renders, escapes, and splits on tag
@@ -445,16 +451,57 @@ class TelegramUI:
         # that, so the whole list went missing rather than arriving in halves.
         # updated_at also went out unescaped. Backticks keep the key
         # copy-pasteable into /forget.
-        lines = [
-            f"`{f.key}` — {f.fact}" + (f" ({f.updated_at})" if f.updated_at else "")
-            for f in facts
-        ]
-        await self._send_long(
-            update,
-            "Что я о тебе помню:\n\n"
-            + "\n\n".join(lines)
-            + "\n\nУдалить: `/forget ключ`",
-        )
+        await self._send_long(update, export.overview(await self._store.facts(), conversations))
+
+    async def cmd_export(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
+        """Every stored row about the user, as a text file, in the private chat.
+
+        Always the private chat, also when asked in the group: the file holds the
+        private chat's messages and tool results, and a group may have other readers.
+        """
+        if not self._authorised(update):
+            return await self._refuse(update)
+        if self._store is None:
+            await update.effective_message.reply_text(
+                "Долговременная память не подключена — выгружать нечего."
+            )
+            return
+        user_id = update.effective_user.id
+        now = time.gmtime()
+        try:
+            text, conversations, rows = await export.export_text(
+                self._store,
+                agent=self._profile.id,
+                now=time.strftime("%Y-%m-%d %H:%M", now),
+            )
+        except StoreUnavailable as exc:
+            logger.warning("export failed: %s", exc)
+            await update.effective_message.reply_text(
+                "Не смог прочитать базу памяти, причина — в логе агента. Попробуй позже."
+            )
+            return
+        try:
+            await ctx.bot.send_document(
+                chat_id=user_id,
+                document=text.encode("utf-8"),
+                filename=f"memory-{self._profile.id}-{time.strftime('%Y-%m-%d', now)}.txt",
+                caption=(
+                    f"Всё, что я о тебе храню: {conversations} разговоров, {rows} записей "
+                    "и факты. Пароли и токены заменены на <REDACTED>."
+                ),
+            )
+        except (Forbidden, BadRequest) as exc:
+            # The bot can write to a private chat only after the person has started it.
+            logger.warning("could not send the export to the private chat: %s", exc)
+            await update.effective_message.reply_text(
+                "Не могу написать тебе в личку. Открой личный чат со мной, нажми Start "
+                "и повтори /export."
+            )
+            return
+        if update.effective_chat.id != user_id:
+            await update.effective_message.reply_text(
+                "Отправил файлом в личку: в группе его увидели бы все."
+            )
 
     async def cmd_forget(self, update: Update, ctx: ContextTypes.DEFAULT_TYPE) -> None:
         if not self._authorised(update):
@@ -809,6 +856,7 @@ class TelegramUI:
         app.add_handler(CommandHandler("help", self.cmd_help))
         app.add_handler(CommandHandler("new", self.cmd_new))
         app.add_handler(CommandHandler("memories", self.cmd_memories))
+        app.add_handler(CommandHandler("export", self.cmd_export))
         app.add_handler(CommandHandler("forget", self.cmd_forget))
         app.add_handler(CommandHandler("model", self.cmd_model))
         app.add_handler(CommandHandler("models", self.cmd_models))

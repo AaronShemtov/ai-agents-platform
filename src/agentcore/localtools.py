@@ -41,12 +41,19 @@ SEARCH_CONVERSATIONS = f"{MEMORY_SERVER}__search_conversations"
 READ_CONVERSATION = f"{MEMORY_SERVER}__read_conversation"
 
 # Sizes of what the reading tools hand back. A tool result is clipped at
-# loop.MAX_TOOL_RESULT_CHARS, 12,000, and these keep a full answer under it.
+# loop.MAX_TOOL_RESULT_CHARS, 12,000, and these keep a full answer under it: the text of
+# the messages and the line above each one, measured at about 60 characters.
 SEARCH_DEFAULT, SEARCH_MAX = 8, 20
 READ_DEFAULT, READ_MAX = 12, 30
-READ_TEXT = 8_000  # spread over the messages of one read
+READ_TEXT = 7_000  # spread over the messages of one read
+READ_HEADER = 70  # the "[id] date · who:" line and the cut note, per message
 READ_FOCUS = 2_500  # the message a search pointed at
 READ_ALONE = 6_000  # that message when it is the only one asked for
+
+
+def read_width(limit: int) -> int:
+    """Characters for each message of a read of `limit` messages, the focused one aside."""
+    return max(200, min(1_500, (READ_TEXT - READ_HEADER * limit) // limit))
 
 # A key is how a fact is replaced later and how a person names it to `/forget`,
 # so it has to be stable and typeable — not a sentence, not a uuid.
@@ -107,9 +114,10 @@ MEMORY_TOOLS: tuple[RemoteTool, ...] = (
         name="search_conversations",
         qualified_name=SEARCH_CONVERSATIONS,
         description=(
-            "Найти, где в разговорах с человеком встречались слова: во всех темах "
-            "группы, в General, в личном чате и в старой части этого разговора, "
-            "которой нет в истории выше. Ищется часть слова без учёта регистра, "
+            "Найти, где в разговорах с человеком встречались слова: в других темах "
+            "группы, в General, в личном чате — они идут первыми, — а после них в "
+            "этом разговоре, в том числе в старой его части, которой нет в истории "
+            "выше. Ищется часть слова без учёта регистра, ё и е не различаются, "
             "поэтому давай основы без окончаний: «миграц», «кластер», «oracle». "
             "Находит сообщения, где есть хоть одно из слов; выше те, где их больше, "
             "при равенстве — свежие. Возвращает разговор, номер сообщения, дату и "
@@ -120,7 +128,10 @@ MEMORY_TOOLS: tuple[RemoteTool, ...] = (
             "properties": {
                 "query": {
                     "type": "string",
-                    "description": "Слова через пробел, до шести, каждое от двух букв.",
+                    "description": (
+                        "Основы слов через пробел, до шести, каждая от двух букв; "
+                        "служебные слова вроде «что», «про» не ищутся."
+                    ),
                 },
                 "limit": {
                     "type": "integer",
@@ -149,16 +160,17 @@ MEMORY_TOOLS: tuple[RemoteTool, ...] = (
                 "conversation": {
                     "type": "string",
                     "description": (
-                        "id разговора из поиска или memory__list_conversations, вида "
-                        "«-1001234567890/78». Для темы той же группы хватит номера "
-                        "темы, «78»; подойдёт и ссылка на тему."
+                        "id разговора — из списка других разговоров в инструкциях, из "
+                        "поиска или memory__list_conversations, вида "
+                        "«-1001234567890/78»; подойдёт и ссылка на тему. Просто номер "
+                        "темы, «78», понимается как тема группы."
                     ),
                 },
                 "around": {
                     "type": "integer",
                     "description": (
-                        "Номер сообщения из поиска: покажу его и соседние. Без него — "
-                        "последние сообщения разговора."
+                        "Номер сообщения из поиска: покажу его и соседние. Не указывай, "
+                        "чтобы получить последние сообщения разговора."
                     ),
                 },
                 "limit": {
@@ -200,13 +212,19 @@ def is_local(qualified_name: str) -> bool:
     return server == MEMORY_SERVER
 
 
-def memory_tools(store: AdbStore | None) -> list[RemoteTool]:
+def memory_tools(store: AdbStore | None, *, recall: bool = True) -> list[RemoteTool]:
     """The memory tools, or none at all when there is nowhere to write.
 
     Offering a tool that cannot work is worse than offering nothing: the model
     would spend a step calling it and a step reading the failure.
+
+    `recall=False` leaves out the three that read conversations. Rows carry no author,
+    and the tools read every conversation the agent has had: right for one person
+    talking to their own agent, a leak the moment a second person may talk to it.
     """
-    return list(MEMORY_TOOLS) if store is not None else []
+    if store is None:
+        return []
+    return [tool for tool in MEMORY_TOOLS if recall or tool.name not in _RECALL]
 
 
 async def call_local(
@@ -253,13 +271,14 @@ async def call_local(
 
         if bare == "forget":
             removed = await store.forget(key)
+            if removed:
+                return ToolResult(ok=True, text=f"забыто: {key}")
+            # A guessed key is the usual way to miss, so say which keys there are:
+            # "nothing to forget" alone reads as "nothing like that was stored".
+            keys = ", ".join(fact.key for fact in await store.facts()) or "фактов нет"
             return ToolResult(
                 ok=True,
-                text=(
-                    f"забыто: {key}"
-                    if removed
-                    else f"нечего забывать: факта с ключом {key} не было"
-                ),
+                text=f"нечего забывать: факта с ключом {key} нет. Ключи сейчас: {keys}",
             )
     except StoreUnavailable as exc:
         logger.warning("local tool %s failed: %s", qualified_name, exc)
@@ -285,14 +304,20 @@ def _message_id(value: Any) -> int | None:
         return None
     if isinstance(value, bool):
         raise ValueError(value)
-    if isinstance(value, int):
-        return value
     if isinstance(value, float) and value.is_integer():
-        return int(value)
-    text = str(value).strip().strip("[]#")
-    if not text.isdigit():
+        value = int(value)
+    if isinstance(value, int):
+        number = value
+    else:
+        text = str(value).strip().strip("[]#")
+        if not text.isdigit():
+            raise ValueError(value)
+        number = int(text)
+    if number < 0:
         raise ValueError(value)
-    return int(text)
+    # Ids start at 1. A 0 is how some models fill an optional integer they mean to
+    # leave out, and read as an id it returned a conversation's oldest messages.
+    return number or None
 
 
 async def _recall(
@@ -323,27 +348,38 @@ async def _recall(
                     ok=False,
                     text="нужен query: слова для поиска, от двух букв, не только союзы и предлоги",
                 )
+            limit = _number(arguments.get("limit"), default=SEARCH_DEFAULT, most=SEARCH_MAX)
             hits = await store.search(
                 agent=agent,
                 terms=terms,
-                limit=_number(arguments.get("limit"), default=SEARCH_DEFAULT, most=SEARCH_MAX),
+                limit=limit,
+                current=(chat_id, thread_id) if chat_id is not None else None,
             )
             return ToolResult(
-                ok=True, text=recall.format_hits(hits, conversations, current, terms)
+                ok=True,
+                text=recall.format_hits(hits, conversations, current, terms, limit=limit),
             )
 
         # read_conversation
+        atlas = recall.Atlas(conversations)
         target = recall.parse_handle(
-            str(arguments.get("conversation") or ""), current_chat=chat_id
+            str(arguments.get("conversation") or ""), topic_chat=atlas.topic_chat(chat_id)
         )
         if target is None:
             return ToolResult(
                 ok=False,
                 text=(
-                    "нужен conversation: id разговора вида «-1001234567890/78» из "
-                    "memory__list_conversations или поиска, номер темы этой группы или "
-                    "ссылка на тему"
+                    "нужен conversation: id разговора вида «-1001234567890/78» из списка "
+                    "разговоров или поиска, ссылка на тему или номер темы группы. "
+                    f"Есть: {atlas.handles()}"
                 ),
+            )
+        if target not in atlas.known:
+            # Said as a failure: an empty read of a conversation that does not exist
+            # reads as "nothing was said there", which is a claim about the past.
+            return ToolResult(
+                ok=False,
+                text=f"такого разговора нет: {recall.handle(*target)}. Есть: {atlas.handles()}",
             )
         try:
             around = _message_id(arguments.get("around"))
@@ -358,7 +394,7 @@ async def _recall(
             thread_id=target[1],
             around=around,
             limit=limit,
-            width=max(250, min(1_500, READ_TEXT // limit)),
+            width=read_width(limit),
             focus_width=READ_ALONE if limit == 1 else READ_FOCUS,
         )
         return ToolResult(

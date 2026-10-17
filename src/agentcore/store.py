@@ -85,6 +85,16 @@ EXCERPT_LEAD = 120
 _NEWEST = 10**15
 
 
+def fold(text: str) -> str:
+    """A search term the way search() compares it: lower case, ё read as е.
+
+    Russian is typed with and without ё, so "отчёт" has to find "отчет" and the other
+    way round. The statement folds the stored text the same way; one character for
+    one, so a position found in the folded text is the same in the original.
+    """
+    return text.lower().replace("ё", "е")
+
+
 class StoreUnavailable(RuntimeError):
     """The database could not be reached or refused the statement."""
 
@@ -197,7 +207,10 @@ class ConversationSummary:
     """One conversation of an agent, as the index and the recall tools describe it.
 
     `first_user` and `last_user` are the opening characters of the person's first and
-    latest message in it, empty when there is none. Times are the database's, UTC.
+    latest message in it, empty when there is none, and the `_cut` flags say whether
+    there was more of it than the preview holds. `first_id` is its oldest row: the
+    order conversations appeared in, and where a forum's topics began. Times are the
+    database's, UTC.
     """
 
     chat_id: int
@@ -207,6 +220,9 @@ class ConversationSummary:
     last_at: str
     first_user: str
     last_user: str
+    first_id: int = 0
+    first_user_cut: bool = False
+    last_user_cut: bool = False
 
 
 @dataclass(frozen=True)
@@ -448,18 +464,22 @@ class AdbStore:
         message the person wrote in it. Tool results are counted but never shown.
         """
         statement = (
-            "select o.chat_id, o.thread_id, o.n, o.first_day, o.last_at, "
-            "f.preview as first_user, l.preview as last_user "
-            "from (select chat_id, thread_id, count(*) as n, max(id) as last_id, "
+            "select o.chat_id, o.thread_id, o.n, o.first_id, o.first_day, o.last_at, "
+            "f.preview as first_user, f.len as first_len, "
+            "l.preview as last_user, l.len as last_len "
+            "from (select chat_id, thread_id, count(*) as n, "
+            "min(id) as first_id, max(id) as last_id, "
             "to_char(min(created_at), 'YYYY-MM-DD') as first_day, "
             "to_char(max(created_at), 'YYYY-MM-DD HH24:MI') as last_at "
             "from conversations where agent = :agent group by chat_id, thread_id) o "
             "left join (select chat_id, thread_id, dbms_lob.substr(content, :width, 1) as preview, "
+            "dbms_lob.getlength(content) as len, "
             "row_number() over (partition by chat_id, thread_id order by id) as rk "
             "from conversations where agent = :agent and role = 'user' "
             "and content is not null) f "
             "on f.chat_id = o.chat_id and f.thread_id = o.thread_id and f.rk = 1 "
             "left join (select chat_id, thread_id, dbms_lob.substr(content, :width, 1) as preview, "
+            "dbms_lob.getlength(content) as len, "
             "row_number() over (partition by chat_id, thread_id order by id desc) as rk "
             "from conversations where agent = :agent and role = 'user' "
             "and content is not null) l "
@@ -476,33 +496,50 @@ class AdbStore:
                 last_at=row.get("last_at") or "",
                 first_user=row.get("first_user") or "",
                 last_user=row.get("last_user") or "",
+                first_id=int(row.get("first_id") or 0),
+                first_user_cut=int(row.get("first_len") or 0) > PREVIEW_CHARS,
+                last_user_cut=int(row.get("last_len") or 0) > PREVIEW_CHARS,
             )
             for row in rows
         ]
 
     async def search(
-        self, *, agent: str, terms: Sequence[str], limit: int
+        self,
+        *,
+        agent: str,
+        terms: Sequence[str],
+        limit: int,
+        current: tuple[int, int] | None = None,
     ) -> list[StoredText]:
         """Messages of `agent`'s conversations that contain any of `terms`.
 
         The person's words and the agent's answers, not tool results: those are most of
         the table and most of them are file contents and logs, which is noise when the
         question is what was said. Case-insensitive substring, so a stem finds every
-        form of a word. Ranked by how many of the terms a message has, then newest.
+        form of a word, and ё is read as е on both sides, the way people type it.
+        Ranked by how many of the terms a message has, then newest.
+
+        `current`, the (chat, topic) a turn is in, goes after every other conversation.
+        Its recent messages are already in the model's transcript, and being the newest
+        they filled every slot and pushed out the other conversations, which are what a
+        search is for. Its older part, beyond the transcript, still comes back after them.
 
         The terms are binds, never part of the statement text: they come from the model.
         Only their number shapes the statement. The excerpt starts a little before the
         first term that matched, because the start of a long answer is rarely the part
         that was searched for.
         """
-        terms = [term.lower() for term in terms if term]
+        terms = [fold(term) for term in terms if term]
         if not terms:
             return []
+        cur_chat, cur_thread = current if current is not None else (0, -1)
         binds: dict[str, Any] = {
             "agent": agent,
             "lim": limit,
             "width": EXCERPT_CHARS,
             "lead": EXCERPT_LEAD,
+            "cur_chat": cur_chat,
+            "cur_thread": cur_thread,
         }
         found: list[str] = []
         first: list[str] = []
@@ -521,10 +558,12 @@ class AdbStore:
             f"{' + '.join(found)} as score, "
             f"coalesce({', '.join(first)}, 1) as pos "
             "from (select id, chat_id, thread_id, role, created_at, content, "
-            "lower(content) as lc from conversations "
+            "translate(lower(content), 'ё', 'е') as lc from conversations "
             "where agent = :agent and role in ('user', 'assistant') "
             "and content is not null)) "
-            "where score > 0 order by score desc, id desc fetch first :lim rows only"
+            "where score > 0 "
+            "order by case when chat_id = :cur_chat and thread_id = :cur_thread "
+            "then 1 else 0 end, score desc, id desc fetch first :lim rows only"
         )
         rows = await self._run(statement, binds)
         return [

@@ -57,7 +57,25 @@ _REDACTIONS: tuple[tuple[re.Pattern[str], str], ...] = (
     ),
     # Credentials inside a URL: https://user:secret@host — user and host are kept.
     (re.compile(r"(://[^/\s:@]+:)[^/\s@]+(@)"), r"\1<REDACTED>\2"),
+    # A JWT: three base64url parts, the first of which always opens with {" encoded.
+    (re.compile(r"\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}"), "<REDACTED>"),
+    # A password given as a value, in English or Russian: the name stays, the value goes.
+    (
+        re.compile(r"(?i)((?:password|passwd|пароль)[\"']?\s*[:=]\s*[\"']?)[^\s\"',}]+"),
+        r"\1<REDACTED>",
+    ),
 )
+
+
+def redact_secrets(text: str) -> str:
+    """The log filter's patterns, for text that leaves by another way.
+
+    What the agent reads back from its own conversations goes into a prompt and may go
+    on into a group chat; a token pasted into the private chat once should not.
+    """
+    for pattern, replacement in _REDACTIONS:
+        text = pattern.sub(replacement, text)
+    return text
 
 
 class SecretRedactionFilter(logging.Filter):
@@ -74,9 +92,7 @@ class SecretRedactionFilter(logging.Filter):
             message = record.getMessage()
         except Exception:  # a broken format string must not lose the line entirely
             return True
-        cleaned = message
-        for pattern, replacement in _REDACTIONS:
-            cleaned = pattern.sub(replacement, cleaned)
+        cleaned = redact_secrets(message)
         if cleaned != message:
             record.msg = cleaned
             record.args = ()

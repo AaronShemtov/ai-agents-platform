@@ -545,6 +545,34 @@ async def test_the_conversations_of_one_agent_are_listed_newest_first(ords: str)
     assert bound(_requests[0])["agent"] == "lead"
 
 
+async def test_a_listing_says_where_a_conversation_began_and_what_its_previews_cut(
+    ords: str,
+) -> None:
+    _replies.append(
+        (
+            200,
+            rows(
+                {
+                    "chat_id": -100123,
+                    "thread_id": 78,
+                    "n": 4,
+                    "first_id": 1852,
+                    "first_day": "2026-10-11",
+                    "last_at": "2026-10-11 21:42",
+                    "first_user": "x" * 200,
+                    "first_len": 3000,
+                    "last_user": "short",
+                    "last_len": 5,
+                }
+            ),
+        )
+    )
+    [got] = await store(ords).conversations(agent="lead")
+    assert got.first_id == 1852
+    assert got.first_user_cut is True
+    assert got.last_user_cut is False
+
+
 async def test_a_listing_that_fails_is_an_error_rather_than_no_conversations(ords: str) -> None:
     """history() answers [] when the database is down, because a turn goes on without
     it. A tool cannot: "there are no other conversations" is a claim about the past."""
@@ -579,7 +607,33 @@ async def test_search_ranks_by_how_many_terms_matched_then_newest(ords: str) -> 
     await store(ords).search(agent="lead", terms=["a1", "b2"], limit=3)
     statement = _requests[0]["statementText"]
     assert "sign(dbms_lob.instr(lc, :t0)) + sign(dbms_lob.instr(lc, :t1)) as score" in statement
-    assert "where score > 0 order by score desc, id desc" in statement
+    assert statement.endswith("then 1 else 0 end, score desc, id desc fetch first :lim rows only")
+
+
+async def test_search_puts_the_conversation_the_turn_is_in_after_the_others(ords: str) -> None:
+    """Its newest messages are already in the transcript, and being the newest they
+    filled every slot a search had."""
+    await store(ords).search(agent="lead", terms=["ords"], limit=8, current=(-100123, 7))
+    request = _requests[0]
+    values = bound(request)
+    assert (values["cur_chat"], values["cur_thread"]) == (-100123, 7)
+    assert (
+        "order by case when chat_id = :cur_chat and thread_id = :cur_thread then 1 else 0 end"
+        in request["statementText"]
+    )
+
+
+async def test_search_without_a_conversation_puts_nothing_last(ords: str) -> None:
+    await store(ords).search(agent="lead", terms=["ords"], limit=8)
+    values = bound(_requests[0])
+    assert (values["cur_chat"], values["cur_thread"]) == (0, -1)  # matches no row
+
+
+async def test_search_reads_yo_as_ye_on_both_sides(ords: str) -> None:
+    await store(ords).search(agent="lead", terms=["Отчёт"], limit=1)
+    request = _requests[0]
+    assert bound(request)["t0"] == "отчет"
+    assert "translate(lower(content), 'ё', 'е') as lc" in request["statementText"]
 
 
 async def test_no_terms_means_no_query_at_all(ords: str) -> None:

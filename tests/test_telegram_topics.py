@@ -532,8 +532,116 @@ async def test_a_listing_that_fails_keeps_the_note_and_the_turn(error: Exception
     bot = FakeBot()
     await ui.on_message(make_update(bot, "a", thread=5, topic=True), ctx_for(bot))
     assert len(loop.runs) == 1
-    assert loop.runs[0].extra_system.endswith(recall.RECALL_NOTE)
+    extra = loop.runs[0].extra_system
+    assert recall.RECALL_NOTE in extra
+    assert "Сегодня " in extra
+    assert "Другие разговоры" not in extra
     assert replies(bot)[-1]["text"] == "re: a"
+
+
+async def test_general_of_a_forum_is_told_its_history_holds_the_old_topics() -> None:
+    store = FakeStore()
+    store.rows[("lead", GROUP, 9)] = [{"role": "user", "content": "в теме"}]
+    ui, loop, _ = make_ui(store=store)
+    bot = FakeBot()
+    await ui.on_message(make_update(bot, "в General"), ctx_for(bot))
+    await ui.on_message(make_update(bot, "в теме", thread=9, topic=True), ctx_for(bot))
+    general, topic = loop.runs
+    assert recall.GENERAL_NOTE in general.extra_system
+    assert recall.GENERAL_NOTE not in topic.extra_system
+
+
+async def test_with_two_people_allowed_a_topic_falls_back_to_the_old_note() -> None:
+    """The tools that read every conversation are not offered then (AgentLoop.catalog),
+    so the note that promises them must not be given either."""
+    loop = FakeLoop()
+    ui = TelegramUI(
+        settings=Settings(telegram_allowed_users="42,43"),
+        profile=SimpleNamespace(
+            id="lead", name="Lead", description="", model=None, tool_allowed=lambda _name: True
+        ),
+        agent_loop=loop,
+        memory=MemoryStore(),
+        store=FakeStore(),
+    )
+    bot = FakeBot()
+    await ui.on_message(make_update(bot, "a", thread=5, topic=True), ctx_for(bot))
+    assert recall.RECALL_NOTE not in loop.runs[0].extra_system
+    assert TOPIC_NOTE in loop.runs[0].extra_system
+
+
+async def test_the_facts_are_shown_with_the_keys_that_replace_and_remove_them() -> None:
+    store = FakeStore()
+    store.facts_known = [Fact(key="git-identity", fact="Коммитит как A", scope="user", updated_at="")]
+    ui, loop, _ = make_ui(store=store)
+    bot = FakeBot()
+    await ui.on_message(make_update(bot, "a", thread=5, topic=True), ctx_for(bot))
+    assert "- [git-identity] Коммитит как A" in loop.runs[0].extra_system
+    assert "считай это достоверным" not in loop.runs[0].extra_system
+
+
+async def test_a_local_model_without_tools_gets_few_facts_and_no_call_to_make() -> None:
+    store = FakeStore()
+    store.facts_known = [
+        Fact(key=f"k{i}", fact="ф" * 100, scope="user", updated_at="") for i in range(20)
+    ]
+    ui, loop, _ = make_ui(
+        store=store,
+        models_ollama="qwen",
+        ollama_base_url="http://ollama.invalid",
+        model_default="qwen",
+        model_allowlist="qwen",
+    )
+    bot = FakeBot()
+    await ui.on_message(make_update(bot, "a"), ctx_for(bot))
+    extra = loop.runs[0].extra_system
+    assert "memory__remember" not in extra
+    assert extra.count("ф" * 100) == telegram_ui.LOCAL_FACTS_CHARS // 100
+
+
+async def test_what_was_read_from_another_conversation_is_not_stored_in_this_one() -> None:
+    """Stored, it would be a copy of another conversation's words that /new there does
+    not remove; the stub keeps the call answered, so the history stays replayable."""
+
+    class ReadingLoop(FakeLoop):
+        async def run(self, *, chat, user_text, model, audit, progress, approver, cancel, extra_system):
+            chat.append({"role": "user", "content": user_text})
+            chat.append(
+                {
+                    "role": "assistant",
+                    "content": None,
+                    "tool_calls": [
+                        {"id": "c1", "type": "function",
+                         "function": {"name": "memory__read_conversation", "arguments": "{}"}},
+                        {"id": "c2", "type": "function",
+                         "function": {"name": "github__get_file_contents", "arguments": "{}"}},
+                    ],
+                }
+            )
+            chat.append({"role": "tool", "tool_call_id": "c1", "content": "секрет из лички"})
+            chat.append({"role": "tool", "tool_call_id": "c2", "content": "файл"})
+            chat.append({"role": "assistant", "content": "ответ"})
+            return SimpleNamespace(text="ответ")
+
+    store = FakeStore()
+    ui = TelegramUI(
+        settings=Settings(telegram_allowed_users="42"),
+        profile=SimpleNamespace(
+            id="lead", name="Lead", description="", model=None, tool_allowed=lambda _name: True
+        ),
+        agent_loop=ReadingLoop(),
+        memory=MemoryStore(),
+        store=store,
+    )
+    bot = FakeBot()
+    await ui.on_message(make_update(bot, "что в личке?", thread=5, topic=True), ctx_for(bot))
+    stored = store.rows[("lead", GROUP, 5)]
+    tool_rows = {m["tool_call_id"]: m["content"] for m in stored if m["role"] == "tool"}
+    assert tool_rows == {"c1": telegram_ui.RECALL_STUB, "c2": "файл"}
+    assert "секрет из лички" not in str(stored)
+    # This process keeps the full text for the rest of the conversation.
+    chat = ui._memory.get(ui._key(make_update(bot, "x", thread=5, topic=True)))
+    assert any(m.get("content") == "секрет из лички" for m in chat.messages)
 
 
 # -- one task at a time per chat, as before -----------------------------------

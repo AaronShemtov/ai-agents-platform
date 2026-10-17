@@ -41,7 +41,11 @@ from telegram.ext import (
 from agentcore import recall
 from agentcore.audit import AuditLog
 from agentcore.config import Settings
-from agentcore.localtools import SEARCH_CONVERSATIONS
+from agentcore.localtools import (
+    LIST_CONVERSATIONS,
+    READ_CONVERSATION,
+    SEARCH_CONVERSATIONS,
+)
 from agentcore.loop import AgentLoop
 from agentcore.memory import ChatMemory, ConversationKey, MemoryStore
 from agentcore.profiles import AgentProfile
@@ -59,6 +63,27 @@ APPROVAL_TIMEOUT = 600.0  # seconds to wait for a button press
 # message and sending to it is refused ("message thread not found"), so seeing it
 # means "no topic".
 GENERAL_TOPIC_ID = 1
+
+# The tools whose results are stored as RECALL_STUB, by the end of the name the model
+# called them by: the catalogue may shorten a long name, and these are short.
+RECALL_TOOL_SUFFIXES = tuple(
+    name.partition("__")[2]
+    for name in (SEARCH_CONVERSATIONS, READ_CONVERSATION, LIST_CONVERSATIONS)
+)
+
+# What a tool result that read another conversation is stored as. The full text stays
+# in this process's transcript; stored, it would be a copy of that conversation's words
+# filed under this one, which /new there would not remove and which this conversation
+# would replay after every restart.
+RECALL_STUB = (
+    "[прочитано из других разговоров; текст не сохраняется — если понадобится снова, "
+    "перечитай]"
+)
+
+# How much of the facts a local model without tools gets, in characters of fact text.
+# Its whole prompt is a few hundred tokens of a 1,000-token budget, and the facts are
+# the one part of it that grows by itself.
+LOCAL_FACTS_CHARS = 600
 
 # Appended to the system prompt inside a topic, after the facts, when the agent cannot
 # read the other conversations — no database, a profile without memory__*, a local
@@ -203,7 +228,7 @@ class TelegramUI:
         """
         if self._store is None:
             return
-        for message in chat.unpersisted():
+        for message in _storable(chat.unpersisted()):
             await self._store.append(
                 agent=self._profile.id,
                 chat_id=chat.chat_id,
@@ -212,7 +237,7 @@ class TelegramUI:
             )
         chat.mark_persisted()
 
-    async def _facts_prompt(self) -> str:
+    async def _facts_prompt(self, *, tools: bool = True) -> str:
         """The facts, as a block appended to the system prompt.
 
         All of them, unsearched — a few dozen cost about a thousand tokens, and
@@ -227,6 +252,19 @@ class TelegramUI:
         if self._store is None:
             return ""
 
+        if not tools:
+            # A local model with no tools: asking it to call memory__remember is asking
+            # for something it cannot do, and its prompt is the wall its turn hits
+            # (Settings.local_system_prompt), so only as many facts as LOCAL_FACTS_CHARS.
+            lines: list[str] = []
+            used = 0
+            for f in await self._store.facts():
+                if used + len(f.fact) > LOCAL_FACTS_CHARS:
+                    break
+                lines.append(f"- {f.fact}")
+                used += len(f.fact)
+            return ("Что ты знаешь о человеке:\n" + "\n".join(lines)) if lines else ""
+
         keeping = (
             "Если узнаёшь устойчивый факт о нём или его проектах — такой, который "
             "пригодится и в следующих разговорах, — сохрани его сам, вызовом "
@@ -240,10 +278,14 @@ class TelegramUI:
         if not facts:
             return keeping
 
-        lines = "\n".join(f"- {f.fact}" for f in facts)
+        # The key in brackets: remember replaces a fact and forget removes one by its key,
+        # and without seeing them the model guessed — a second copy of a fact under a new
+        # key, or "nothing to forget" about a fact that was there.
+        lines = "\n".join(f"- [{f.key}] {f.fact}" for f in facts)
         return (
-            "Что ты знаешь о человеке, с которым говоришь (накоплено в прошлых "
-            "разговорах, считай это достоверным):\n"
+            "Что ты знаешь о человеке, с которым говоришь, — заметки, которые ты сам "
+            "сохранил в прошлых разговорах (в скобках ключ: по нему факт заменяют и "
+            "удаляют):\n"
             f"{lines}\n\n" + keeping
         )
 
@@ -253,7 +295,8 @@ class TelegramUI:
         the model reads is the facts, the note and the index of the other conversations,
         then this one — first priority by being the history itself."""
         if not self._recall_offered(model):
-            parts = [await self._facts_prompt(), TOPIC_NOTE if key.thread_id else ""]
+            tools = not (self._s.is_local_model(model) and not self._s.local_tools)
+            parts = [await self._facts_prompt(tools=tools), TOPIC_NOTE if key.thread_id else ""]
         else:
             parts = list(
                 await asyncio.gather(self._facts_prompt(), self._recall_prompt(key))
@@ -268,6 +311,10 @@ class TelegramUI:
         than TOPIC_NOTE says it plainly.
         """
         if self._store is None or not self._profile.tool_allowed(SEARCH_CONVERSATIONS):
+            return False
+        # Mirrors AgentLoop.catalog: with more than one person allowed, the tools that
+        # read every conversation are not offered.
+        if len(self._s.allowed_user_ids()) != 1:
             return False
         # Mirrors AgentLoop.run, which withholds every tool from such a model.
         return not (self._s.is_local_model(model) and not self._s.local_tools)
@@ -284,7 +331,8 @@ class TelegramUI:
         except Exception as exc:  # broad on purpose, see above
             logger.warning("could not list the other conversations: %s", exc)
             conversations = None
-        return recall.prompt_block(conversations, key)
+        today = time.strftime("%Y-%m-%d", time.gmtime())
+        return recall.prompt_block(conversations, key, today=today)
 
     @staticmethod
     def _key(update: Update) -> ConversationKey:
@@ -770,6 +818,28 @@ class TelegramUI:
         app.add_handler(CallbackQueryHandler(self.on_callback, pattern=r"^ap:"))
         app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, self.on_message))
         return app
+
+
+def _storable(messages: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """The messages as they go into the database: a result of a tool that read another
+    conversation replaced by RECALL_STUB, everything else as it is.
+
+    The call is told apart by the name the assistant used for it; the result keeps its
+    tool_call_id, so the stored history still pairs every call with an answer and stays
+    replayable.
+    """
+    reading: set[str] = set()
+    out: list[dict[str, Any]] = []
+    for message in messages:
+        if message.get("role") == "assistant":
+            for call in message.get("tool_calls") or []:
+                name = str((call.get("function") or {}).get("name") or "")
+                if name.endswith(RECALL_TOOL_SUFFIXES):
+                    reading.add(str(call.get("id")))
+        if message.get("role") == "tool" and str(message.get("tool_call_id")) in reading:
+            message = {**message, "content": RECALL_STUB}
+        out.append(message)
+    return out
 
 
 def _format_arguments(arguments: dict[str, Any]) -> str:

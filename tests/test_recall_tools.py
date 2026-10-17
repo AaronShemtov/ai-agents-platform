@@ -17,16 +17,20 @@ from typing import Any
 
 import pytest
 
+from agentcore import recall
 from agentcore.config import Settings
 from agentcore.llm.base import LLMResponse, ToolCall, Usage
 from agentcore.localtools import (
+    FORGET,
     LIST_CONVERSATIONS,
     READ_ALONE,
     READ_CONVERSATION,
     READ_FOCUS,
+    REMEMBER,
     SEARCH_CONVERSATIONS,
     call_local,
     memory_tools,
+    read_width,
 )
 from agentcore.loop import AgentLoop
 from agentcore.mcp.toolset import build_catalog
@@ -52,7 +56,12 @@ class FakeStore:
         messages: list[StoredText] | None = None,
         fails: bool = False,
     ) -> None:
-        self.listing = listing if listing is not None else []
+        self.listing = listing if listing is not None else [
+            summary(GROUP, 939),
+            summary(GROUP, 78),
+            summary(GROUP, 0),
+            summary(PRIVATE, 0),
+        ]
         self.hits = hits or []
         self.messages = messages or []
         self.fails = fails
@@ -64,8 +73,10 @@ class FakeStore:
             raise StoreUnavailable("cannot reach the database: timed out")
         return list(self.listing)
 
-    async def search(self, *, agent, terms, limit):
-        self.asked.append(("search", {"agent": agent, "terms": list(terms), "limit": limit}))
+    async def search(self, *, agent, terms, limit, current=None):
+        self.asked.append(
+            ("search", {"agent": agent, "terms": list(terms), "limit": limit, "current": current})
+        )
         return list(self.hits)
 
     async def read(self, *, agent, chat_id, thread_id, around, limit, width, focus_width):
@@ -98,6 +109,7 @@ def summary(chat_id: int, thread_id: int, first_user: str = "") -> ConversationS
         last_at="2026-10-11 21:42",
         first_user=first_user,
         last_user="",
+        first_id={(GROUP, 0): 341, (PRIVATE, 0): 21}.get((chat_id, thread_id), 1800 + thread_id),
     )
 
 
@@ -172,7 +184,12 @@ def test_search_sends_the_words_and_marks_where_each_hit_is() -> None:
     result = call(SEARCH_CONVERSATIONS, {"query": "Загадал число"}, store)
     assert result.ok
     [asked] = store.calls("search")
-    assert asked == {"agent": "lead", "terms": ["загадал", "число"], "limit": 8}
+    assert asked == {
+        "agent": "lead",
+        "terms": ["загадал", "число"],
+        "limit": 8,
+        "current": (GROUP, 939),  # ranked after the other conversations
+    }
     assert "[1853] тема 78" in result.text
     assert f"id {GROUP}/78" in result.text
 
@@ -216,6 +233,27 @@ def test_read_finds_the_conversation_however_the_model_names_it(conversation, ta
     assert asked["agent"] == "lead"
 
 
+@pytest.mark.parametrize(("conversation", "target"), [("78", (GROUP, 78)), ("0", (GROUP, 0))])
+def test_a_bare_topic_number_from_the_private_chat_is_a_topic_of_the_group(
+    conversation: str, target: tuple[int, int]
+) -> None:
+    """A private chat has no topics: "78" read there was a conversation that cannot
+    exist, and came back as one with nothing said in it."""
+    store = FakeStore()
+    assert call(READ_CONVERSATION, {"conversation": conversation}, store, chat_id=PRIVATE, thread_id=0).ok
+    [asked] = store.calls("read")
+    assert (asked["chat_id"], asked["thread_id"]) == target
+
+
+def test_a_conversation_that_does_not_exist_is_a_failure_with_the_ones_that_do() -> None:
+    store = FakeStore()
+    result = call(READ_CONVERSATION, {"conversation": "4242"}, store)
+    assert not result.ok
+    assert "такого разговора нет" in result.text
+    assert f"{GROUP}/78" in result.text  # what there is instead
+    assert store.calls("read") == []
+
+
 @pytest.mark.parametrize("conversation", ["", "тема 78", None, "General"])
 def test_read_refuses_a_conversation_it_cannot_name(conversation: Any) -> None:
     store = FakeStore()
@@ -225,14 +263,26 @@ def test_read_refuses_a_conversation_it_cannot_name(conversation: Any) -> None:
     assert store.calls("read") == []
 
 
-@pytest.mark.parametrize(("around", "sent"), [(1853, 1853), ("1853", 1853), ("[1853]", 1853), (1853.0, 1853), (None, None), ("", None)])
+@pytest.mark.parametrize(
+    ("around", "sent"),
+    [
+        (1853, 1853),
+        ("1853", 1853),
+        ("[1853]", 1853),
+        (1853.0, 1853),
+        (None, None),
+        ("", None),
+        (0, None),  # how some models fill an optional integer they mean to leave out
+        ("0", None),
+    ],
+)
 def test_around_is_taken_as_a_model_writes_it(around: Any, sent: int | None) -> None:
     store = FakeStore()
     assert call(READ_CONVERSATION, {"conversation": "78", "around": around}, store).ok
     assert store.calls("read")[0]["around"] == sent
 
 
-@pytest.mark.parametrize("around", ["вчера", True, 18.5, "-3"])
+@pytest.mark.parametrize("around", ["вчера", True, 18.5, "-3", -3])
 def test_an_around_that_is_not_a_message_number_is_refused(around: Any) -> None:
     store = FakeStore()
     result = call(READ_CONVERSATION, {"conversation": "78", "around": around}, store)
@@ -251,8 +301,37 @@ def test_one_message_asked_for_alone_is_given_more_room() -> None:
     assert default["focus_width"] == READ_FOCUS
     assert default["limit"] == 12
     assert many["limit"] == 30
-    # Thirty messages still fit in one tool result: the loop clips at 12,000.
-    assert many["width"] * many["limit"] + READ_FOCUS < 12_000
+    assert many["width"] == read_width(30)
+
+
+@pytest.mark.parametrize("limit", [1, 2, 5, 12, 30])
+def test_a_read_of_long_messages_fits_in_one_tool_result(limit: int) -> None:
+    """The loop clips a tool result at 12,000 characters; the headers count too, and
+    leaving them out of the budget is how the last message of a long read was lost."""
+    width = read_width(limit)
+    focus = READ_ALONE if limit == 1 else READ_FOCUS
+    messages = [
+        StoredText(
+            id=1000 + i,
+            chat_id=GROUP,
+            thread_id=78,
+            role="assistant",
+            at="2026-10-11 21:42",
+            text="я" * (focus if i == 0 else width),
+            start=1,
+            length=20_000,
+        )
+        for i in range(limit)
+    ]
+    out = recall.format_read(
+        messages,
+        chat_id=GROUP,
+        thread_id=78,
+        conversations=FakeStore().listing,
+        current=None,
+        around=1000,
+    )
+    assert len(out) < 12_000
 
 
 def test_read_marks_the_message_it_was_asked_about() -> None:
@@ -334,7 +413,7 @@ def test_the_loop_reads_as_the_agent_from_the_conversation_the_turn_is_in() -> N
             system_prompt="test",
             tool_allowed=lambda _name: True,
         ),
-        settings=Settings(max_billable_tokens_per_turn=200_000),
+        settings=Settings(telegram_allowed_users="42", max_billable_tokens_per_turn=200_000),
         llm=FakeLLM(
             [
                 LLMResponse(
@@ -358,6 +437,31 @@ def test_the_loop_reads_as_the_agent_from_the_conversation_the_turn_is_in() -> N
     tool_message = next(m for m in chat.messages if m["role"] == "tool")
     # The hit is in the topic the turn is in, so it is marked as this conversation.
     assert "тема 939 (этот разговор)" in tool_message["content"]
+
+
+def _catalog_names(allowed_users: str) -> list[str]:
+    loop = AgentLoop(
+        profile=SimpleNamespace(
+            id="lead", max_steps=5, max_tokens_per_turn=10_000, system_prompt="t",
+            tool_allowed=lambda _name: True,
+        ),
+        settings=Settings(telegram_allowed_users=allowed_users),
+        llm=FakeLLM([]),
+        pool=NoPool(),
+        policy=Policy(Settings()),
+        store=FakeStore(),
+    )
+    return asyncio.run(loop.catalog()).names()
+
+
+def test_with_two_people_allowed_the_conversations_cannot_be_read() -> None:
+    """Rows carry no author: with a second person allowed, reading every conversation
+    would read one's private chat to the other. Facts stay; they always were shared."""
+    one = _catalog_names("42")
+    two = _catalog_names("42,43")
+    assert set(RECALL_TOOLS) <= set(one)
+    assert not set(RECALL_TOOLS) & set(two)
+    assert {REMEMBER, FORGET} <= set(two)
 
 
 # -- the fake stays honest ----------------------------------------------------
